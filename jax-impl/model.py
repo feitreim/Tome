@@ -91,8 +91,8 @@ class Attention(nnx.Module):
     def __call__(
         self,
         x: BFloat16[Array, "B S D"],
-        cos,
-        sin,
+        cos: BFloat16[Array, "S D"],
+        sin: BFloat16[Array, "S D"],
         mask,
         layer_idx: int,
         cache: KVCache | None = None,
@@ -181,7 +181,7 @@ class OLMoE(nnx.Module):
         cur_pos: int = 0,
     ) -> tuple[BFloat16[Array, "B S V"], KVCache | None]:
         B, S = tokens.shape
-        x = self.embed(tokens)  # (B, S, D)
+        x: BFloat16[Array, "B S D"] = self.embed(tokens)
         head_dim = x.shape[-1] // self.layers[0].attn.num_heads
 
         # For cached inference, only compute RoPE for new positions
@@ -191,11 +191,10 @@ class OLMoE(nnx.Module):
             sin = sin[cur_pos : cur_pos + S]
             # Mask allows attending to all cached positions + current
             total_len = cur_pos + S
-            mask = jnp.tril(jnp.ones((S, total_len), dtype=bool))[None, None, :, :]  # (1, 1, S, total_len)
+            mask = jnp.tril(jnp.ones((S, total_len), dtype=bool))[None, None, :, :]
         else:
             cos, sin = rope_freqs(head_dim, S)
-            mask = jnp.tril(jnp.ones((S, S), dtype=bool))[None, None, :, :]  # (1, 1, S, S)
-
+            mask = jnp.tril(jnp.ones((S, S), dtype=bool))[None, None, :, :]
         new_cache = cache
         for i, layer in enumerate(self.layers):
             x, new_cache = layer(x, cos, sin, mask, i, new_cache, cur_pos)
