@@ -24,6 +24,8 @@ scheduler/target/
 *.swp
 *.swo
 
+# Test data
+test_inputs/
+
 # OS
 .DS_Store
-
