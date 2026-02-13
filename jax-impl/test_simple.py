@@ -42,10 +42,10 @@ def test_forward_no_cache():
         rngs=nnx.Rngs(42),
     )
 
-    tokens = jnp.array([1, 2, 3, 4, 5], dtype=jnp.int32)
+    tokens = jnp.array([[1, 2, 3, 4, 5]], dtype=jnp.int32)  # (1, 5)
     logits, cache = model(tokens, cache=None, cur_pos=0)
 
-    assert logits.shape == (5, 100), f"Expected shape (5, 100), got {logits.shape}"
+    assert logits.shape == (1, 5, 100), f"Expected shape (1, 5, 100), got {logits.shape}"
     assert cache is None, "Cache should be None when not provided"
     print(f"  Output shape: {logits.shape}")
     print("  PASSED")
@@ -70,24 +70,25 @@ def test_forward_with_cache():
     # Create cache
     cache = KVCache.new(
         layers=2,
+        batch=1,
         max_seq_len=64,
         kv_heads=4,
         head_dim=128 // 4,
     )
 
     # Prefill with prompt
-    prompt = jnp.array([1, 2, 3, 4, 5], dtype=jnp.int32)
+    prompt = jnp.array([[1, 2, 3, 4, 5]], dtype=jnp.int32)  # (1, 5)
     logits, cache = model(prompt, cache=cache, cur_pos=0)
 
-    assert logits.shape == (5, 100), f"Expected shape (5, 100), got {logits.shape}"
+    assert logits.shape == (1, 5, 100), f"Expected shape (1, 5, 100), got {logits.shape}"
     assert cache is not None, "Cache should be returned"
     print(f"  Prefill output shape: {logits.shape}")
 
     # Generate next token
-    next_token = jnp.array([6], dtype=jnp.int32)
+    next_token = jnp.array([[6]], dtype=jnp.int32)  # (1, 1)
     logits, cache = model(next_token, cache=cache, cur_pos=5)
 
-    assert logits.shape == (1, 100), f"Expected shape (1, 100), got {logits.shape}"
+    assert logits.shape == (1, 1, 100), f"Expected shape (1, 1, 100), got {logits.shape}"
     print(f"  Generation output shape: {logits.shape}")
     print("  PASSED")
 
@@ -99,15 +100,15 @@ def test_attention_shapes():
 
     attn = Attention(dim=128, num_heads=4, num_kv_heads=4, rngs=nnx.Rngs(0))
 
-    S = 10
-    x = jnp.zeros((S, 128), dtype=jnp.bfloat16)
+    B, S = 2, 10
+    x = jnp.zeros((B, S, 128), dtype=jnp.bfloat16)
     head_dim = 128 // 4
     cos, sin = rope_freqs(head_dim, S)
-    mask = jnp.tril(jnp.ones((S, S), dtype=bool))[None, :, :]
+    mask = jnp.tril(jnp.ones((S, S), dtype=bool))[None, None, :, :]
 
     out, cache = attn(x, cos, sin, mask, layer_idx=0, cache=None, cur_pos=0)
 
-    assert out.shape == (S, 128), f"Expected shape (10, 128), got {out.shape}"
+    assert out.shape == (B, S, 128), f"Expected shape (2, 10, 128), got {out.shape}"
     assert cache is None, "Cache should be None"
     print(f"  Output shape: {out.shape}")
     print("  PASSED")
@@ -126,18 +127,17 @@ def test_moe_shapes():
         rngs=nnx.Rngs(0),
     )
 
-    x = jnp.zeros((10, 128), dtype=jnp.bfloat16)
+    x = jnp.zeros((2, 10, 128), dtype=jnp.bfloat16)  # (B, S, D)
     out = moe(x)
 
-    assert out.shape == (10, 128), f"Expected shape (10, 128), got {out.shape}"
+    assert out.shape == (2, 10, 128), f"Expected shape (2, 10, 128), got {out.shape}"
     print(f"  Output shape: {out.shape}")
     print("  PASSED")
 
 
 def test_batch_size_gt_1():
-    """Test with batch size > 1 using vmap."""
-    print("\n[TEST] Batch size > 1 (vmap)")
-    from jax import vmap
+    """Test with batch size > 1."""
+    print("\n[TEST] Batch size > 1")
 
     model = OLMoE(
         vocab_size=100,
@@ -159,17 +159,61 @@ def test_batch_size_gt_1():
             [5, 6, 7, 8],
         ],
         dtype=jnp.int32,
-    )
+    )  # (2, 4)
 
-    # Use vmap to process batch
-    def forward_single(tokens):
-        return model(tokens, cache=None, cur_pos=0)[0]
-
-    batched_forward = vmap(forward_single)
-    logits = batched_forward(batch_tokens)
+    logits, _ = model(batch_tokens, cache=None, cur_pos=0)
 
     assert logits.shape == (2, 4, 100), f"Expected shape (2, 4, 100), got {logits.shape}"
     print(f"  Batch output shape: {logits.shape}")
+    print("  PASSED")
+
+
+def test_batch_with_cache():
+    """Test batch inference with KV cache."""
+    print("\n[TEST] Batch inference with cache")
+
+    model = OLMoE(
+        vocab_size=100,
+        dim=64,
+        num_layers=2,
+        num_heads=4,
+        num_kv_heads=4,
+        num_experts=4,
+        active_experts=2,
+        intermediate_size=128,
+        max_seq_len=32,
+        rngs=nnx.Rngs(42),
+    )
+
+    # Create cache for batch of 2
+    cache = KVCache.new(
+        layers=2,
+        batch=2,
+        max_seq_len=32,
+        kv_heads=4,
+        head_dim=64 // 4,
+    )
+
+    # Prefill with batched prompts
+    prompts = jnp.array(
+        [
+            [1, 2, 3],
+            [4, 5, 6],
+        ],
+        dtype=jnp.int32,
+    )  # (2, 3)
+
+    logits, cache = model(prompts, cache=cache, cur_pos=0)
+
+    assert logits.shape == (2, 3, 100), f"Expected shape (2, 3, 100), got {logits.shape}"
+    print(f"  Prefill output shape: {logits.shape}")
+
+    # Generate next tokens
+    next_tokens = jnp.array([[7], [8]], dtype=jnp.int32)  # (2, 1)
+    logits, cache = model(next_tokens, cache=cache, cur_pos=3)
+
+    assert logits.shape == (2, 1, 100), f"Expected shape (2, 1, 100), got {logits.shape}"
+    print(f"  Generation output shape: {logits.shape}")
     print("  PASSED")
 
 
@@ -181,6 +225,7 @@ if __name__ == "__main__":
         test_attention_shapes,
         test_moe_shapes,
         test_batch_size_gt_1,
+        test_batch_with_cache,
     ]
 
     passed = 0

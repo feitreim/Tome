@@ -1,5 +1,6 @@
 """Comparison tests: our OLMoE vs HuggingFace transformers."""
 
+import device  # Auto-configures JAX device (CUDA/MPS/CPU)
 import flax.nnx as nnx
 import jax.numpy as jnp
 import numpy as np
@@ -57,7 +58,7 @@ def _hf_position_embeddings(hf_model, x_pt, S):
 def test_rmsnorm(hf_model, our_model):
     tokens = _make_tokens()
     x_pt = hf_model.model.embed_tokens(torch.tensor(tokens))  # (1, S, D)
-    x_jax = jnp.array(x_pt.detach().float().numpy(), dtype=jnp.bfloat16)[0]  # Remove batch dim
+    x_jax = jnp.array(x_pt.detach().float().numpy(), dtype=jnp.bfloat16)  # Keep batch dim
 
     # HF RMSNorm
     hf_out = hf_model.model.layers[0].input_layernorm(x_pt)
@@ -65,7 +66,7 @@ def test_rmsnorm(hf_model, our_model):
 
     # Our RMSNorm
     our_out = our_model.layers[0].input_norm(x_jax)
-    our_np = np.array(our_out, dtype=np.float32)[None, :, :]  # Add batch dim back
+    our_np = np.array(our_out, dtype=np.float32)
 
     diff = np.max(np.abs(hf_np - our_np))
     print(f"  RMSNorm max diff: {diff:.6f}")
@@ -89,14 +90,14 @@ def test_attention_layer(hf_model, our_model):
     hf_np = hf_attn_out.detach().float().numpy()
 
     # Our attention
-    normed_jax = jnp.array(normed_pt.detach().float().numpy(), dtype=jnp.bfloat16)[0]  # Remove batch dim
+    normed_jax = jnp.array(normed_pt.detach().float().numpy(), dtype=jnp.bfloat16)  # Keep batch dim
     from model import rope_freqs
 
     head_dim = 2048 // 16
     cos, sin = rope_freqs(head_dim, S)
-    mask = jnp.tril(jnp.ones((S, S), dtype=bool))[None, :, :]
+    mask = jnp.tril(jnp.ones((S, S), dtype=bool))[None, None, :, :]
     our_attn_out, _ = our_model.layers[0].attn(normed_jax, cos, sin, mask, layer_idx=0, cache=None, cur_pos=0)
-    our_np = np.array(our_attn_out, dtype=np.float32)[None, :, :]  # Add batch dim back
+    our_np = np.array(our_attn_out, dtype=np.float32)
 
     diff = np.max(np.abs(hf_np - our_np))
     print(f"  Attention max diff: {diff:.6f}")
@@ -124,9 +125,9 @@ def test_moe_layer(hf_model, our_model):
     hf_np = hf_moe_out.detach().float().numpy()
 
     # Our MoE
-    moe_input_jax = jnp.array(moe_input_pt.detach().float().numpy(), dtype=jnp.bfloat16)[0]  # Remove batch dim
+    moe_input_jax = jnp.array(moe_input_pt.detach().float().numpy(), dtype=jnp.bfloat16)  # Keep batch dim
     our_moe_out = our_model.layers[0].moe(moe_input_jax)
-    our_np = np.array(our_moe_out, dtype=np.float32)[None, :, :]  # Add batch dim back
+    our_np = np.array(our_moe_out, dtype=np.float32)
 
     diff = np.max(np.abs(hf_np - our_np))
     print(f"  MoE max diff: {diff:.6f}")
@@ -142,8 +143,8 @@ def test_full_model_output(hf_model, our_model):
     hf_logits = hf_out.logits.float().numpy()
 
     # Our forward
-    our_logits, _ = our_model(jnp.array(tokens[0]), cache=None, cur_pos=0)
-    our_logits_np = np.array(our_logits, dtype=np.float32)[None, :, :]  # Add batch dim back
+    our_logits, _ = our_model(jnp.array(tokens), cache=None, cur_pos=0)
+    our_logits_np = np.array(our_logits, dtype=np.float32)
 
     diff = np.max(np.abs(hf_logits - our_logits_np))
     print(f"  Full model max diff: {diff:.6f}")

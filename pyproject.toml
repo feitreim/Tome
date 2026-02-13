@@ -12,6 +12,10 @@ dependencies = [
     "torch>=2.10.0",
 ]
 
+[project.optional-dependencies]
+# Development tools
+dev = ["ruff>=0.8.0", "pyright>=1.1.0"]
+
 [tool.ruff]
 target-version = "py314"
 line-length = 120

@@ -3,10 +3,10 @@ from typing import TYPE_CHECKING
 import flax.nnx as nnx
 import jax
 import jax.numpy as jnp
-from kvcache import KVCache
 
 if TYPE_CHECKING:
     from jaxtyping import Array, BFloat16
+    from kvcache import KVCache
 
 
 def rope_freqs(head_dim: int, seq_len: int, theta: float = 10000.0):
@@ -23,7 +23,9 @@ def rotate_half(x):
     return jnp.concatenate([-x2, x1], axis=-1)
 
 
-def apply_rope(q, k, cos, sin):
+def apply_rope(
+    q: BFloat16[Array, "... _heads _seq _head_dim"], k: BFloat16[Array, "... _heads _seq _head_dim"], cos, sin
+):
     # q, k: (H, S, D)  cos, sin: (S, D)
     cos = cos[None, :, :]  # (1, S, D)
     sin = sin[None, :, :]
@@ -37,7 +39,7 @@ class RMSNorm(nnx.Module):
         self.eps = eps
         self.weight = nnx.Param(jnp.ones(dim, dtype=jnp.bfloat16))
 
-    def __call__(self, x: BFloat16[Array, "S D"]) -> BFloat16[Array, "S D"]:
+    def __call__(self, x: BFloat16[Array, "... D"]) -> BFloat16[Array, "... D"]:
         x_f32 = x.astype(jnp.float32)
         normed = x_f32 * jax.lax.rsqrt(jnp.mean(x_f32**2, axis=-1, keepdims=True) + self.eps)
         return (normed * self.weight.value).astype(jnp.bfloat16)
@@ -51,23 +53,26 @@ class MoEMLP(nnx.Module):
         self.down_proj = nnx.Param(jnp.zeros((num_experts, dim, intermediate_size), dtype="bfloat16"))
         self.gate_proj = nnx.Param(jnp.zeros((num_experts, intermediate_size, dim), dtype="bfloat16"))
 
-    def __call__(self, x: BFloat16[Array, "S E"]) -> BFloat16[Array, "S E"]:
-        S, D = x.shape
+    def __call__(self, x: BFloat16[Array, "B S D"]) -> BFloat16[Array, "B S D"]:
+        B, S, D = x.shape
+        # Flatten batch and sequence into a single token dimension
+        x_flat = x.reshape(B * S, D)  # (T, D)
 
-        logits = self.gate(x)  # (S, num_experts)
+        logits = self.gate(x_flat)  # (T, num_experts)
         g = jax.nn.softmax(logits.astype(jnp.float32), axis=-1).astype(logits.dtype)
-        prob, choices = jax.lax.top_k(g, self.topk)  # (S, topk) each
+        prob, choices = jax.lax.top_k(g, self.topk)  # (T, topk) each
 
-        up_w = self.up_proj.value[choices]  # (S, topk, H, D)
-        gate_w = self.gate_proj.value[choices]  # (S, topk, H, D)
-        down_w = self.down_proj.value[choices]  # (S, topk, D, H)
+        up_w = self.up_proj.value[choices]  # (T, topk, H, D)
+        gate_w = self.gate_proj.value[choices]  # (T, topk, H, D)
+        down_w = self.down_proj.value[choices]  # (T, topk, D, H)
 
-        up = jnp.einsum("sd,skhd->skh", x, up_w)  # (S, topk, H)
-        gate = jnp.einsum("sd,skhd->skh", x, gate_w)  # (S, topk, H)
-        hidden = jax.nn.silu(gate) * up  # (S, topk, H)
-        down = jnp.einsum("skh,skdh->skd", hidden, down_w)  # (S, topk, D)
+        up = jnp.einsum("td,tkhd->tkh", x_flat, up_w)  # (T, topk, H)
+        gate = jnp.einsum("td,tkhd->tkh", x_flat, gate_w)  # (T, topk, H)
+        hidden = jax.nn.silu(gate) * up  # (T, topk, H)
+        down = jnp.einsum("tkh,tkdh->tkd", hidden, down_w)  # (T, topk, D)
 
-        return (down * prob[..., None]).sum(axis=1)  # (S, D)
+        out = (down * prob[..., None]).sum(axis=1)  # (T, D)
+        return out.reshape(B, S, D)
 
 
 class Attention(nnx.Module):
@@ -85,24 +90,28 @@ class Attention(nnx.Module):
 
     def __call__(
         self,
-        x: BFloat16[Array, "S D"],
+        x: BFloat16[Array, "B S D"],
         cos,
         sin,
         mask,
         layer_idx: int,
         cache: KVCache | None = None,
         cur_pos: int = 0,
-    ) -> tuple[BFloat16[Array, "S D"], KVCache | None]:
-        S, D = x.shape
-        q = self.q_norm(self.q_proj(x))  # (S, D)
-        k = self.k_norm(self.k_proj(x))  # (S, kv_heads * head_dim)
-        v = self.v_proj(x)  # (S, kv_heads * head_dim)
+    ) -> tuple[BFloat16[Array, "B S D"], KVCache | None]:
+        B, S, D = x.shape
+        q = self.q_norm(self.q_proj(x))  # (B, S, D)
+        k = self.k_norm(self.k_proj(x))  # (B, S, kv_heads * head_dim)
+        v = self.v_proj(x)  # (B, S, kv_heads * head_dim)
 
-        q = q.reshape(S, self.num_heads, self.head_dim).transpose(1, 0, 2)  # (H, S, D)
-        k = k.reshape(S, self.num_kv_heads, self.head_dim).transpose(1, 0, 2)  # (kv_H, S, D)
-        v = v.reshape(S, self.num_kv_heads, self.head_dim).transpose(1, 0, 2)  # (kv_H, S, D)
+        q = q.reshape(B, S, self.num_heads, self.head_dim).transpose(0, 2, 1, 3)  # (B, H, S, D)
+        k = k.reshape(B, S, self.num_kv_heads, self.head_dim).transpose(0, 2, 1, 3)  # (B, kv_H, S, D)
+        v = v.reshape(B, S, self.num_kv_heads, self.head_dim).transpose(0, 2, 1, 3)  # (B, kv_H, S, D)
 
-        q, k = apply_rope(q, k, cos, sin)
+        # Apply RoPE (broadcast cos/sin over batch dimension)
+        cos_expanded = cos[None, None, :, :]  # (1, 1, S, head_dim)
+        sin_expanded = sin[None, None, :, :]  # (1, 1, S, head_dim)
+        q = q * cos_expanded + rotate_half(q) * sin_expanded
+        k = k * cos_expanded + rotate_half(k) * sin_expanded
 
         # Handle KV cache
         new_cache = cache
@@ -111,15 +120,15 @@ class Attention(nnx.Module):
         else:
             # Repeat KV heads if using GQA
             if self.n_rep > 1:
-                k = jnp.repeat(k, self.n_rep, axis=0)  # (H, S, D)
-                v = jnp.repeat(v, self.n_rep, axis=0)  # (H, S, D)
+                k = jnp.repeat(k, self.n_rep, axis=1)  # (B, H, S, D)
+                v = jnp.repeat(v, self.n_rep, axis=1)  # (B, H, S, D)
 
         scale = self.head_dim**-0.5
-        attn = (q @ k.transpose(0, 2, 1)) * scale  # (H, S, S_kv)
+        attn = (q @ k.transpose(0, 1, 3, 2)) * scale  # (B, H, S, S_kv)
         attn = jnp.where(mask, attn, jnp.finfo(jnp.float32).min)
         attn = jax.nn.softmax(attn.astype(jnp.float32), axis=-1).astype(jnp.bfloat16)
 
-        out = (attn @ v).transpose(1, 0, 2).reshape(S, D)  # (S, D)
+        out = (attn @ v).transpose(0, 2, 1, 3).reshape(B, S, D)  # (B, S, D)
         return self.o_proj(out), new_cache
 
 
@@ -167,12 +176,12 @@ class OLMoE(nnx.Module):
 
     def __call__(
         self,
-        tokens: BFloat16[Array, "S"],
+        tokens: BFloat16[Array, "B S"],
         cache: KVCache | None = None,
         cur_pos: int = 0,
-    ) -> tuple[BFloat16[Array, "S V"], KVCache | None]:
-        (S,) = tokens.shape
-        x = self.embed(tokens)
+    ) -> tuple[BFloat16[Array, "B S V"], KVCache | None]:
+        B, S = tokens.shape
+        x = self.embed(tokens)  # (B, S, D)
         head_dim = x.shape[-1] // self.layers[0].attn.num_heads
 
         # For cached inference, only compute RoPE for new positions
@@ -182,10 +191,10 @@ class OLMoE(nnx.Module):
             sin = sin[cur_pos : cur_pos + S]
             # Mask allows attending to all cached positions + current
             total_len = cur_pos + S
-            mask = jnp.tril(jnp.ones((S, total_len), dtype=bool))[None, :, :]
+            mask = jnp.tril(jnp.ones((S, total_len), dtype=bool))[None, None, :, :]  # (1, 1, S, total_len)
         else:
             cos, sin = rope_freqs(head_dim, S)
-            mask = jnp.tril(jnp.ones((S, S), dtype=bool))[None, :, :]
+            mask = jnp.tril(jnp.ones((S, S), dtype=bool))[None, None, :, :]  # (1, 1, S, S)
 
         new_cache = cache
         for i, layer in enumerate(self.layers):
