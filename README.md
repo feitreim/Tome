@@ -16,12 +16,6 @@ uv sync
 uv sync --extra cuda12
 ```
 
-### NVIDIA GPU (CUDA 11)
-
-```bash
-uv sync --extra cuda11
-```
-
 > **Note**: Apple Silicon MPS/Metal support is included in the base JAX installation. CUDA support uses optional dependency extras to install the appropriate JAX variant.
 
 ## Device Configuration
@@ -82,5 +76,3 @@ uvx ruff format .
 # Type check
 uvx pyright
 ```
-
-See [CLAUDE.md](CLAUDE.md) for detailed project conventions.
