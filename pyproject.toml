@@ -1,0 +1,41 @@
+[project]
+name = "tome"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.14"
+dependencies = [
+    "einops>=0.8.2",
+    "flax>=0.12.3",
+    "jax>=0.9.0.1",
+    "jaxtyping>=0.3.7",
+    "torch>=2.10.0",
+]
+
+[tool.ruff]
+target-version = "py314"
+line-length = 120
+
+[tool.ruff.lint]
+select = [
+    "E",     # pycodestyle errors
+    "W",     # pycodestyle warnings
+    "F",     # pyflakes
+    "I",     # isort
+    "N",     # pep8-naming
+    "UP",    # pyupgrade
+    "B",     # flake8-bugbear
+    "SIM",   # flake8-simplify
+    "TCH",   # flake8-type-checking
+    "RUF",   # ruff-specific rules
+]
+ignore = ["F722"]  # jaxtyping annotations use syntax pyflakes doesn't understand
+
+[tool.ruff.lint.isort]
+known-first-party = ["tome"]
+
+[tool.pyright]
+pythonVersion = "3.14"
+typeCheckingMode = "standard"
+venvPath = "."
+venv = ".venv"
