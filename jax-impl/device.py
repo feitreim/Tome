@@ -10,7 +10,7 @@ if TYPE_CHECKING:
     from jax import Device
 
 
-def setup_device(prefer: str | None = None) -> "Device":
+def setup_device(prefer: str | None = None) -> Device:
     """
     Auto-detect and configure JAX device (CPU, MPS, or CUDA).
 
@@ -43,7 +43,9 @@ def setup_device(prefer: str | None = None) -> "Device":
             print(f"Using {device.platform} device: {device}")
             return device
         else:
-            warnings.warn(f"Requested platform '{prefer}' not available. Available: {available_types}. Falling back to auto-select.")
+            warnings.warn(
+                f"Requested platform '{prefer}' not available. Available: {available_types}. Falling back to auto-select."
+            )
 
     # Auto-select: prefer GPU > MPS > CPU
     for platform in ["gpu", "METAL", "cpu"]:

@@ -4,43 +4,42 @@ JAX/Flax implementation of OLMoE (Open Language Mixture of Experts) with cross-p
 
 ## Installation
 
-### CPU Only
+### CPU / Apple Silicon (MPS)
+
 ```bash
 uv sync
 ```
 
-### NVIDIA GPU (CUDA)
+### NVIDIA GPU (CUDA 12)
+
 ```bash
-# Install base dependencies first
-uv sync
-
-# Then install JAX with CUDA support (choose your CUDA version)
-# For CUDA 12:
-uv pip install --upgrade "jax[cuda12_pip]" -f https://storage.googleapis.com/jax-releases/jax_cuda_releases.html
-
-# For CUDA 11:
-uv pip install --upgrade "jax[cuda11_pip]" -f https://storage.googleapis.com/jax-releases/jax_cuda_releases.html
+uv sync --extra cuda12
 ```
 
-### Apple Silicon (MPS/Metal)
+### NVIDIA GPU (CUDA 11)
+
 ```bash
-# MPS support is included in base JAX on macOS
-uv sync
+uv sync --extra cuda11
 ```
+
+> **Note**: Apple Silicon MPS/Metal support is included in the base JAX installation. CUDA support uses optional dependency extras to install the appropriate JAX variant.
 
 ## Device Configuration
 
 The project **automatically detects** and uses the best available device:
+
 - **CUDA** (NVIDIA GPU) - highest priority
 - **MPS** (Apple Silicon Metal) - second priority
 - **CPU** - fallback
 
 ### Check Your Device
+
 ```bash
 uv run python jax-impl/check_device.py
 ```
 
 ### Force Specific Device
+
 Use the `JAX_PLATFORM` environment variable:
 
 ```bash
