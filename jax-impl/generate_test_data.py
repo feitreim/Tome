@@ -90,10 +90,10 @@ def generate_test_data():
     }
     with open(OUTPUT_DIR / "metadata.json", "w") as f:
         json.dump(metadata, f, indent=2)
-    print(f"\n  Saved metadata.json")
+    print("\n  Saved metadata.json")
 
     print(f"\n{'=' * 50}")
-    print(f"Test data generation complete!")
+    print("Test data generation complete!")
     print(f"All files saved to: {OUTPUT_DIR.absolute()}")
 
 

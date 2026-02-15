@@ -3,6 +3,7 @@ from typing import TYPE_CHECKING
 import flax.nnx as nnx
 import jax
 import jax.numpy as jnp
+from jax.sharding import PartitionSpec as P
 
 if TYPE_CHECKING:
     from jaxtyping import Array, BFloat16
@@ -24,10 +25,12 @@ def rotate_half(x):
 
 
 def apply_rope(
-    q: BFloat16[Array, "... _heads _seq _head_dim"], k: BFloat16[Array, "... _heads _seq _head_dim"], cos, sin
+    q: BFloat16[Array, "... _heads _seq _head_dim"],
+    k: BFloat16[Array, "... _heads _seq _head_dim"],
+    cos: BFloat16[Array, "_seq _head_dim"],
+    sin: BFloat16[Array, "_seq _head_dim"],
 ):
-    # q, k: (H, S, D)  cos, sin: (S, D)
-    cos = cos[None, :, :]  # (1, S, D)
+    cos = cos[None, :, :]
     sin = sin[None, :, :]
     q = q * cos + rotate_half(q) * sin
     k = k * cos + rotate_half(k) * sin
@@ -49,27 +52,29 @@ class MoEMLP(nnx.Module):
     def __init__(self, num_experts, active_experts, dim, intermediate_size, rngs):
         self.topk = active_experts
         self.gate = nnx.Linear(dim, num_experts, rngs=rngs, use_bias=False)
-        self.up_proj = nnx.Param(jnp.zeros((num_experts, intermediate_size, dim), dtype="bfloat16"))
-        self.down_proj = nnx.Param(jnp.zeros((num_experts, dim, intermediate_size), dtype="bfloat16"))
-        self.gate_proj = nnx.Param(jnp.zeros((num_experts, intermediate_size, dim), dtype="bfloat16"))
+        expert_shape_hd = (num_experts, intermediate_size, dim)
+        expert_shape_dh = (num_experts, dim, intermediate_size)
+        self.up_proj = nnx.Param(jnp.zeros(expert_shape_hd, dtype=jnp.bfloat16), sharding=("tp", None, None))
+        self.down_proj = nnx.Param(jnp.zeros(expert_shape_dh, dtype=jnp.bfloat16), sharding=("tp", None, None))
+        self.gate_proj = nnx.Param(jnp.zeros(expert_shape_hd, dtype=jnp.bfloat16), sharding=("tp", None, None))
+
+    def _gather(self, param: nnx.Param, choices: BFloat16[Array, "T topk"]) -> BFloat16[Array, "T topk ..."]:
+        return param.value.at[choices].get(out_sharding=P(None, None, None, None))
 
     def __call__(self, x: BFloat16[Array, "B S D"]) -> BFloat16[Array, "B S D"]:
         B, S, D = x.shape
-        # Flatten batch and sequence into a single token dimension
         x_flat = x.reshape(B * S, D)  # (T, D)
 
         logits = self.gate(x_flat)  # (T, num_experts)
         g = jax.nn.softmax(logits.astype(jnp.float32), axis=-1).astype(logits.dtype)
         prob, choices = jax.lax.top_k(g, self.topk)  # (T, topk) each
 
-        up_w = self.up_proj.value[choices]  # (T, topk, H, D)
-        gate_w = self.gate_proj.value[choices]  # (T, topk, H, D)
-        down_w = self.down_proj.value[choices]  # (T, topk, D, H)
-
-        up = jnp.einsum("td,tkhd->tkh", x_flat, up_w)  # (T, topk, H)
-        gate = jnp.einsum("td,tkhd->tkh", x_flat, gate_w)  # (T, topk, H)
+        # Gather and project sequentially to avoid holding all 3 gathered weight tensors in memory.
+        # Each gathered tensor is (T, topk, H, D) which is ~1 GB at full sequence length.
+        up = jnp.einsum("td,tkhd->tkh", x_flat, self._gather(self.up_proj, choices))
+        gate = jnp.einsum("td,tkhd->tkh", x_flat, self._gather(self.gate_proj, choices))
         hidden = jax.nn.silu(gate) * up  # (T, topk, H)
-        down = jnp.einsum("tkh,tkdh->tkd", hidden, down_w)  # (T, topk, D)
+        down = jnp.einsum("tkh,tkdh->tkd", hidden, self._gather(self.down_proj, choices))
 
         out = (down * prob[..., None]).sum(axis=1)  # (T, D)
         return out.reshape(B, S, D)

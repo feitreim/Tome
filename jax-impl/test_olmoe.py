@@ -3,10 +3,11 @@
 import json
 from pathlib import Path
 
-import device  # Auto-configures JAX device (CUDA/MPS/CPU)
 import flax.nnx as nnx
+import jax
 import jax.numpy as jnp
 import numpy as np
+from device import setup_mesh
 
 MODEL_NAME = "allenai/OLMoE-1B-7B-0924"
 SEQ_LEN = 32
@@ -15,7 +16,7 @@ ATOL_FULL = 1.0  # accumulated bf16 tolerance for full 16-layer model
 TEST_DATA_DIR = Path("test_inputs")
 
 
-def _get_our_model(checkpoint_path: str):
+def _get_our_model(checkpoint_path: str, mesh=None):
     from load_weights import load_olmoe_weights
     from model import OLMoE
 
@@ -31,7 +32,7 @@ def _get_our_model(checkpoint_path: str):
         max_seq_len=2048,
         rngs=nnx.Rngs(0),
     )
-    load_olmoe_weights(model, checkpoint_path)
+    load_olmoe_weights(model, checkpoint_path, mesh=mesh)
     return model
 
 
@@ -145,27 +146,29 @@ if __name__ == "__main__":
     checkpoint_path = download_olmoe(MODEL_NAME)
     print(f"Checkpoint at: {checkpoint_path}")
 
-    print("Loading our model...")
-    our_model = _get_our_model(checkpoint_path)
+    mesh = setup_mesh()
+    with jax.set_mesh(mesh):
+        print("Loading our model...")
+        our_model = _get_our_model(checkpoint_path, mesh=mesh)
 
-    tests = [
-        ("RMSNorm", test_rmsnorm),
-        ("Attention layer", test_attention_layer),
-        ("MoE layer", test_moe_layer),
-        ("Full model output", test_full_model_output),
-    ]
+        tests = [
+            ("RMSNorm", test_rmsnorm),
+            ("Attention layer", test_attention_layer),
+            ("MoE layer", test_moe_layer),
+            ("Full model output", test_full_model_output),
+        ]
 
-    passed = 0
-    failed = 0
-    for name, fn in tests:
-        print(f"\n[TEST] {name}")
-        try:
-            fn(our_model)
-            print("  PASSED")
-            passed += 1
-        except Exception as e:
-            print(f"  FAILED: {e}")
-            failed += 1
+        passed = 0
+        failed = 0
+        for name, fn in tests:
+            print(f"\n[TEST] {name}")
+            try:
+                fn(our_model)
+                print("  PASSED")
+                passed += 1
+            except Exception as e:
+                print(f"  FAILED: {e}")
+                failed += 1
 
     print(f"\n{'=' * 40}")
     print(f"Results: {passed} passed, {failed} failed out of {len(tests)}")
