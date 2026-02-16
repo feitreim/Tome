@@ -10,7 +10,7 @@ MODEL_NAME = "Qwen/Qwen3-0.6B"
 SEQ_LEN = 32
 ATOL = 2e-2  # bf16 ULP is 0.0078125 near 1.0; cross-framework rounding can differ by ~2 ULP
 ATOL_FULL = 1.0
-TEST_DATA_DIR = Path("test_inputs")
+TEST_DATA_DIR = Path(__file__).parent / "test_inputs"
 
 
 def _get_our_model(checkpoint_path: str):
@@ -77,14 +77,9 @@ def test_attention_layer(our_model):
     rmsnorm_out = np.load(TEST_DATA_DIR / "rmsnorm_layer0.npy")
     hf_attention = np.load(TEST_DATA_DIR / "attention_layer0.npy")
 
-    seq_len = rmsnorm_out.shape[1]
-
     normed_mlx = mx.array(rmsnorm_out).astype(mx.bfloat16)
-    from rope import rope_freqs
-
-    cos, sin = rope_freqs(128, seq_len, 1000000.0)
-    mask = mx.expand_dims(mx.expand_dims(mx.tril(mx.ones((seq_len, seq_len))), axis=0), axis=0).astype(mx.bool_)
-    our_attn_out, _ = our_model.layers[0].self_attn(normed_mlx, cos, sin, mask, layer_idx=0, cache=None)
+    mask = "causal"
+    our_attn_out, _ = our_model.layers[0].self_attn(normed_mlx, mask, layer_idx=0, cache=None)
     mx.eval(our_attn_out)
     our_np = np.array(our_attn_out.astype(mx.float32))
 

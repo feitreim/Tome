@@ -8,7 +8,7 @@ import torch
 
 MODEL_NAME = "Qwen/Qwen3-0.6B"
 SEQ_LEN = 32
-OUTPUT_DIR = Path("test_inputs")
+OUTPUT_DIR = Path(__file__).parent / "test_inputs"
 
 
 def _get_hf_model():
