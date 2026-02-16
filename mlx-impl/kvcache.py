@@ -16,7 +16,6 @@ class KVCache:
         k: mx.array,
         v: mx.array,
         layer_idx: int,
-        n_rep: int,
     ) -> tuple[mx.array, mx.array]:
         if self.keys[layer_idx] is None:
             self.keys[layer_idx] = k
@@ -25,14 +24,12 @@ class KVCache:
             self.keys[layer_idx] = mx.concatenate([self.keys[layer_idx], k], axis=2)
             self.values[layer_idx] = mx.concatenate([self.values[layer_idx], v], axis=2)
 
-        full_k = self.keys[layer_idx]
-        full_v = self.values[layer_idx]
-
-        if n_rep > 1:
-            full_k = mx.repeat(full_k, n_rep, axis=1)
-            full_v = mx.repeat(full_v, n_rep, axis=1)
-
-        return full_k, full_v
+        return self.keys[layer_idx], self.values[layer_idx]
 
     def advance(self, num_tokens: int):
         self.offset += num_tokens
+
+    def get_seq_len(self, layer_idx: int) -> int:
+        if self.keys[layer_idx] is None:
+            return 0
+        return self.keys[layer_idx].shape[2]
