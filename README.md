@@ -1,68 +1,93 @@
 # Tome
 
-JAX/Flax implementation of OLMoE (Open Language Mixture of Experts) with cross-platform device support.
+MLX implementation of Nanbeige4.1-3B, a dense decoder-only transformer with Grouped Query Attention, optimized for Apple Silicon.
 
 ## Installation
-
-### CPU / Apple Silicon (MPS)
 
 ```bash
 uv sync
 ```
 
-### NVIDIA GPU (CUDA 12)
+## Running
+
+Start the scheduler, inference node, and TUI in three terminals:
 
 ```bash
-uv sync --extra cuda12
+# Terminal 1: Scheduler (Rust HTTP server, routes requests to nodes)
+./start_scheduler.sh
+
+# Terminal 2: MLX inference node (gRPC server, runs the model)
+./start_node.sh
+
+# Terminal 3: TUI (interactive chat interface)
+./start_tui.sh
 ```
 
-> **Note**: Apple Silicon MPS/Metal support is included in the base JAX installation. CUDA support uses optional dependency extras to install the appropriate JAX variant.
-
-## Device Configuration
-
-The project **automatically detects** and uses the best available device:
-
-- **CUDA** (NVIDIA GPU) - highest priority
-- **MPS** (Apple Silicon Metal) - second priority
-- **CPU** - fallback
-
-### Check Your Device
+Register the node with the scheduler (You shouldn't need to do this):
 
 ```bash
-uv run python jax-impl/check_device.py
+curl -X POST http://localhost:8080/v1/nodes \
+  -H "Content-Type: application/json" \
+  -d '{"addr": "http://localhost:50052"}'
 ```
 
-### Force Specific Device
-
-Use the `JAX_PLATFORM` environment variable:
+### Tests & Benchmarks
 
 ```bash
-# Force CPU
-JAX_PLATFORM=cpu uv run test_olmoe.py
+# Run component tests against HuggingFace reference
+uv run mlx-impl/test_components.py
 
-# Force MPS (Apple Silicon)
-JAX_PLATFORM=mps uv run test_olmoe.py
+# Measure KL divergence vs HuggingFace
+uv run mlx-impl/measure_kl_div.py
 
-# Force CUDA (NVIDIA GPU)
-JAX_PLATFORM=gpu uv run test_olmoe.py
+# Benchmark inference
+uv run mlx-impl/benchmark.py
 ```
 
-## Running Tests
+First run will download the Nanbeige4.1-3B checkpoint from HuggingFace.
 
-```bash
-cd jax-impl
-uv run test_olmoe.py
+## OpenCode
+
+To use Tome as a backend for [OpenCode](https://opencode.ai), add this to `~/.config/opencode/opencode.json`:
+
+```json
+{
+  "$schema": "https://opencode.ai/config.json",
+  "provider": {
+    "tome": {
+      "npm": "@ai-sdk/openai-compatible",
+      "name": "Tome (local)",
+      "options": {
+        "baseURL": "http://localhost:8080/v1"
+      },
+      "models": {
+        "Nanbeige/Nanbeige4.1-3B": {
+          "name": "Nanbeige4.1-3B (Tome MLX)",
+          "limit": {
+            "context": 262144,
+            "output": 4096
+          }
+        }
+      }
+    }
+  }
+}
 ```
 
-First run will download the OLMoE-1B-7B checkpoint from HuggingFace.
+Then start the scheduler and node, and select the Tome provider in OpenCode.
 
 ## Project Structure
 
-- `jax-impl/model.py` - OLMoE model implementation using Flax NNX
-- `jax-impl/device.py` - Cross-platform device configuration
-- `jax-impl/load_weights.py` - HuggingFace checkpoint loading
-- `jax-impl/test_olmoe.py` - Validation tests vs HuggingFace Transformers
-- `scheduler/` - Planned Rust inference scheduler
+- `mlx-impl/model.py` - Nanbeige4.1-3B model implementation using MLX
+- `mlx-impl/load_weights.py` - HuggingFace checkpoint loading
+- `mlx-impl/kvcache.py` - KV cache for autoregressive generation
+- `mlx-impl/node.py` - gRPC inference node server
+- `mlx-impl/test_components.py` - Validation tests vs HuggingFace Transformers
+- `mlx-impl/measure_kl_div.py` - KL divergence measurement
+- `mlx-impl/benchmark.py` - Inference benchmarks
+- `mlx-impl/benchmark_kernel.py` - Metal kernel microbenchmarks
+- `scheduler/` - Rust inference scheduler
+- `tui/` - Ratatui interactive chat interface
 
 ## Development
 
@@ -74,5 +99,5 @@ uvx ruff check .
 uvx ruff format .
 
 # Type check
-uvx pyright
+uvx ty check
 ```

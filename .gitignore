@@ -16,7 +16,8 @@ build/
 uv.lock
 
 # Rust
-scheduler/target/
+target/
+**/*.rs.bk
 
 # IDE
 .idea/
@@ -29,3 +30,6 @@ test_inputs/
 
 # OS
 .DS_Store
+
+# grpc
+/generated/

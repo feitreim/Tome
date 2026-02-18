@@ -1,13 +1,15 @@
 [project]
 name = "tome"
 version = "0.1.0"
-description = "Add your description here"
+description = "MLX implementation of Nanbeige4.1-3B for Apple Silicon"
 readme = "README.md"
 requires-python = ">=3.14"
 dependencies = [
     "accelerate>=1.12.0",
     "einops>=0.8.2",
     "flax>=0.12.3",
+    "grpcio>=1.68.0",
+    "grpcio-tools>=1.68.0",
     "huggingface-hub>=1.4.1",
     "jax>=0.9.0.1",
     "jaxtyping>=0.3.7",
