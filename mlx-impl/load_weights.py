@@ -8,7 +8,7 @@ import torch
 from safetensors.torch import load_file
 
 
-def download_qwen3(model_name: str = "Qwen/Qwen3-0.6B") -> str:
+def download_qwen3(model_name: str = "Nanbeige/Nanbeige4.1-3B") -> str:
     from huggingface_hub import snapshot_download
 
     return snapshot_download(
@@ -55,9 +55,15 @@ def load_qwen3_weights(model: nn.Module, checkpoint_path: str | Path):
         layer.self_attn.v_proj.weight = _to_mlx(state_dict.pop(f"{pfx}.self_attn.v_proj.weight"))
         layer.self_attn.o_proj.weight = _to_mlx(state_dict.pop(f"{pfx}.self_attn.o_proj.weight"))
 
-        # QK norms
-        layer.self_attn.q_norm.weight = _to_mlx(state_dict.pop(f"{pfx}.self_attn.q_norm.weight"))
-        layer.self_attn.k_norm.weight = _to_mlx(state_dict.pop(f"{pfx}.self_attn.k_norm.weight"))
+        # QK norms are present for Qwen-style configs and absent for Llama-style configs.
+        q_norm_key = f"{pfx}.self_attn.q_norm.weight"
+        k_norm_key = f"{pfx}.self_attn.k_norm.weight"
+        if layer.self_attn.q_norm is not None and layer.self_attn.k_norm is not None:
+            layer.self_attn.q_norm.weight = _to_mlx(state_dict.pop(q_norm_key))
+            layer.self_attn.k_norm.weight = _to_mlx(state_dict.pop(k_norm_key))
+        else:
+            state_dict.pop(q_norm_key, None)
+            state_dict.pop(k_norm_key, None)
 
         # Layer norms
         layer.input_layernorm.weight = _to_mlx(state_dict.pop(f"{pfx}.input_layernorm.weight"))

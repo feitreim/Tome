@@ -1,4 +1,4 @@
-"""Benchmark prefill and decode performance for Qwen3-0.6B on MLX."""
+"""Benchmark prefill and decode performance for Nanbeige4.1-3B on MLX."""
 
 import time
 
@@ -8,17 +8,17 @@ from kvcache import KVCache
 from load_weights import download_qwen3, load_qwen3_weights
 from model import Qwen3
 
-MODEL_NAME = "Qwen/Qwen3-0.6B"
-VOCAB_SIZE = 151936
-DIM = 1024
-NUM_LAYERS = 28
-NUM_HEADS = 16
-NUM_KV_HEADS = 8
+MODEL_NAME = "Nanbeige/Nanbeige4.1-3B"
+VOCAB_SIZE = 166144
+DIM = 2560
+NUM_LAYERS = 32
+NUM_HEADS = 20
+NUM_KV_HEADS = 4
 HEAD_DIM = 128
-INTERMEDIATE_SIZE = 3072
-MAX_SEQ_LEN = 40960
-ROPE_THETA = 1000000.0
-EPS = 1e-6
+INTERMEDIATE_SIZE = 10496
+MAX_SEQ_LEN = 262144
+ROPE_THETA = 70000000.0
+EPS = 1e-5
 
 WARMUP_ITERS = 2
 BENCH_ITERS = 5
@@ -43,7 +43,9 @@ def build_model() -> Qwen3:
         max_seq_len=MAX_SEQ_LEN,
         rope_theta=ROPE_THETA,
         eps=EPS,
-        tie_word_embeddings=True,
+        tie_word_embeddings=False,
+        use_qk_norm=False,
+        rope_traditional=True,
     )
     load_qwen3_weights(model, checkpoint_path)
     return model

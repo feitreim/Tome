@@ -1,4 +1,4 @@
-"""MLX inference node with gRPC server for Qwen3-0.6B."""
+"""MLX inference node with gRPC server for Nanbeige4.1-3B."""
 
 from __future__ import annotations
 
@@ -52,9 +52,9 @@ class InferenceNodeServicer(inference_pb2_grpc.InferenceNodeServicer):
         self,
         model: Qwen3,
         max_batch_size: int = 32,
-        max_seq_len: int = 2048,
-        vocab_size: int = 151936,
-        eos_token_id: int = 151645,
+        max_seq_len: int = 262144,
+        vocab_size: int = 166144,
+        eos_token_id: int = 166101,
     ):
         self.model = model
         self.max_batch_size = max_batch_size
@@ -324,29 +324,31 @@ def _register_with_scheduler(grpc_port: int, scheduler_url: str) -> None:
 
 async def serve(
     port: int = 50052,
-    checkpoint_path: str = "Qwen/Qwen3-0.6B",
+    checkpoint_path: str = "Nanbeige/Nanbeige4.1-3B",
     max_batch_size: int = 32,
     scheduler_url: str = "http://localhost:8080",
 ):
     """Start the gRPC inference node server."""
-    logger.info("Starting MLX inference node for Qwen3-0.6B...")
+    logger.info("Starting MLX inference node for Nanbeige4.1-3B...")
 
     # Load model
     logger.info(f"Loading model from {checkpoint_path}")
 
-    # Default Qwen3-0.6B configuration
+    # Default Nanbeige4.1-3B configuration
     config = {
-        "vocab_size": 151936,
-        "dim": 1024,
-        "num_layers": 28,
-        "num_heads": 16,
-        "num_kv_heads": 8,
+        "vocab_size": 166144,
+        "dim": 2560,
+        "num_layers": 32,
+        "num_heads": 20,
+        "num_kv_heads": 4,
         "head_dim": 128,
-        "intermediate_size": 3072,
-        "max_seq_len": 2048,
-        "rope_theta": 1000000.0,
-        "eps": 1e-6,
+        "intermediate_size": 10496,
+        "max_seq_len": 262144,
+        "rope_theta": 70000000.0,
+        "eps": 1e-5,
         "tie_word_embeddings": False,
+        "use_qk_norm": False,
+        "rope_traditional": True,
     }
 
     model = Qwen3(**config)
@@ -362,6 +364,7 @@ async def serve(
         max_batch_size=max_batch_size,
         max_seq_len=config["max_seq_len"],
         vocab_size=config["vocab_size"],
+        eos_token_id=166101,
     )
 
     inference_pb2_grpc.add_InferenceNodeServicer_to_server(servicer, server)
@@ -382,9 +385,14 @@ async def serve(
 if __name__ == "__main__":
     import argparse
 
-    parser = argparse.ArgumentParser(description="MLX inference node with gRPC server for Qwen3-0.6B")
+    parser = argparse.ArgumentParser(description="MLX inference node with gRPC server for Nanbeige4.1-3B")
     parser.add_argument("--port", type=int, default=50052, help="gRPC server port (default: 50052)")
-    parser.add_argument("--checkpoint", type=str, default="Qwen/Qwen3-0.6B", help="Model checkpoint path")
+    parser.add_argument(
+        "--checkpoint",
+        type=str,
+        default="Nanbeige/Nanbeige4.1-3B",
+        help="Model checkpoint path",
+    )
     parser.add_argument("--max-batch-size", type=int, default=32, help="Maximum batch size")
 
     args = parser.parse_args()

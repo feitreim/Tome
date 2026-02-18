@@ -6,7 +6,7 @@ from pathlib import Path
 import numpy as np
 import torch
 
-MODEL_NAME = "Qwen/Qwen3-0.6B"
+MODEL_NAME = "Nanbeige/Nanbeige4.1-3B"
 SEQ_LEN = 32
 OUTPUT_DIR = Path(__file__).parent / "test_inputs"
 
@@ -17,7 +17,7 @@ def _get_hf_model():
     return AutoModelForCausalLM.from_pretrained(MODEL_NAME, torch_dtype=torch.bfloat16, device_map="cpu")
 
 
-def _make_tokens(vocab_size=151936, seq_len=SEQ_LEN):
+def _make_tokens(vocab_size=166144, seq_len=SEQ_LEN):
     rng = np.random.RandomState(42)
     return rng.randint(0, vocab_size, size=(1, seq_len))
 
@@ -88,15 +88,15 @@ def generate_test_data():
     metadata = {
         "model_name": MODEL_NAME,
         "seq_len": SEQ_LEN,
-        "vocab_size": 151936,
-        "dim": 1024,
-        "num_layers": 28,
-        "num_heads": 16,
-        "num_kv_heads": 8,
+        "vocab_size": 166144,
+        "dim": 2560,
+        "num_layers": 32,
+        "num_heads": 20,
+        "num_kv_heads": 4,
         "head_dim": 128,
-        "intermediate_size": 3072,
-        "rope_theta": 1000000.0,
-        "rms_norm_eps": 1e-6,
+        "intermediate_size": 10496,
+        "rope_theta": 70000000.0,
+        "rms_norm_eps": 1e-5,
     }
     with open(OUTPUT_DIR / "metadata.json", "w") as f:
         json.dump(metadata, f, indent=2)

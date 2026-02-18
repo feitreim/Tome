@@ -18,7 +18,7 @@ async def test_prefill(stub: inference_pb2_grpc.InferenceNodeStub):
 
     request = inference_pb2.PrefillRequest(
         request_id="test-mlx-001",
-        tokens=[151643, 9906, 11, 856, 836, 374],  # Example Qwen3 token IDs (BOS + "Hello, my name is")
+        tokens=[166100, 12075, 25, 248],  # Example token IDs (BOS + short prompt)
         temperature=0.7,
         max_tokens=100,
     )
@@ -54,7 +54,7 @@ async def test_stream_generate(stub: inference_pb2_grpc.InferenceNodeStub):
 
     request = inference_pb2.GenerateRequest(
         request_id="test-mlx-stream-001",
-        tokens=[151643, 9906, 11, 856, 836, 374],  # BOS + "Hello, my name is"
+        tokens=[166100, 12075, 25, 248],  # BOS + short prompt
         temperature=0.7,
         max_tokens=20,
     )

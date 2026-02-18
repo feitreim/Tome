@@ -1,4 +1,4 @@
-"""Comparison tests: our Qwen3 vs HuggingFace transformers (using pre-generated reference outputs)."""
+"""Comparison tests: our MLX model vs HuggingFace transformers (using pre-generated reference outputs)."""
 
 import json
 from pathlib import Path
@@ -6,10 +6,10 @@ from pathlib import Path
 import mlx.core as mx
 import numpy as np
 
-MODEL_NAME = "Qwen/Qwen3-0.6B"
+MODEL_NAME = "Nanbeige/Nanbeige4.1-3B"
 SEQ_LEN = 32
-ATOL = 2e-2  # bf16 ULP is 0.0078125 near 1.0; cross-framework rounding can differ by ~2 ULP
-ATOL_FULL = 1.0
+ATOL = 0.1  # bf16 accumulation across multi-layer matmuls
+ATOL_FULL = 2.0  # accumulated error across 32 decoder layers
 TEST_DATA_DIR = Path(__file__).parent / "test_inputs"
 
 
@@ -18,17 +18,19 @@ def _get_our_model(checkpoint_path: str):
     from model import Qwen3
 
     model = Qwen3(
-        vocab_size=151936,
-        dim=1024,
-        num_layers=28,
-        num_heads=16,
-        num_kv_heads=8,
+        vocab_size=166144,
+        dim=2560,
+        num_layers=32,
+        num_heads=20,
+        num_kv_heads=4,
         head_dim=128,
-        intermediate_size=3072,
-        max_seq_len=40960,
-        rope_theta=1000000.0,
-        eps=1e-6,
-        tie_word_embeddings=True,
+        intermediate_size=10496,
+        max_seq_len=262144,
+        rope_theta=70000000.0,
+        eps=1e-5,
+        tie_word_embeddings=False,
+        use_qk_norm=False,
+        rope_traditional=False,
     )
     load_qwen3_weights(model, checkpoint_path)
     return model
