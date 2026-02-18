@@ -1,0 +1,56 @@
+syntax = "proto3";
+
+package inference;
+
+service InferenceNode {
+  rpc Prefill(PrefillRequest) returns (PrefillResponse);
+  rpc Decode(DecodeRequest) returns (DecodeResponse);
+  rpc StreamGenerate(GenerateRequest) returns (stream TokenResponse);
+  rpc GetStatus(StatusRequest) returns (NodeStatus);
+}
+
+message PrefillRequest {
+  string request_id = 1;
+  repeated uint32 tokens = 2;
+  float temperature = 3;
+  uint32 max_tokens = 4;
+}
+
+message PrefillResponse {
+  string request_id = 1;
+  uint32 next_token_id = 2;
+  uint32 cache_position = 3;
+}
+
+message DecodeRequest {
+  string request_id = 1;
+  uint32 cache_position = 2;
+}
+
+message DecodeResponse {
+  string request_id = 1;
+  uint32 token_id = 2;
+  bool is_finished = 3;
+}
+
+message GenerateRequest {
+  string request_id = 1;
+  repeated uint32 tokens = 2;
+  float temperature = 3;
+  uint32 max_tokens = 4;
+}
+
+message TokenResponse {
+  string request_id = 1;
+  uint32 token_id = 2;
+  bool is_finished = 3;
+}
+
+message StatusRequest {}
+
+message NodeStatus {
+  uint32 active_sequences = 1;
+  float gpu_utilization = 2;
+  uint32 queue_depth = 3;
+  uint64 cached_tokens = 4;
+}
