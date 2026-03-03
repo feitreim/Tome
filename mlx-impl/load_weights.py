@@ -8,7 +8,7 @@ import torch
 from safetensors.torch import load_file
 
 
-def download_qwen3(model_name: str = "Nanbeige/Nanbeige4.1-3B") -> str:
+def download_qwen3(model_name: str = "Qwen/Qwen3-0.6B") -> str:
     from huggingface_hub import snapshot_download
 
     return snapshot_download(
@@ -18,7 +18,8 @@ def download_qwen3(model_name: str = "Nanbeige/Nanbeige4.1-3B") -> str:
 
 
 def _to_mlx(tensor: torch.Tensor) -> mx.array:
-    return mx.array(tensor.to(torch.float32).numpy()).astype(mx.bfloat16)
+    # Use float16 as it's often faster on Metal, as noted in rl-values
+    return mx.array(tensor.to(torch.float32).numpy()).astype(mx.float16)
 
 
 def load_qwen3_weights(model: nn.Module, checkpoint_path: str | Path):
@@ -48,19 +49,23 @@ def load_qwen3_weights(model: nn.Module, checkpoint_path: str | Path):
     for i in range(num_layers):
         pfx = f"model.layers.{i}"
         layer = model.layers[i]
+        attn = layer.self_attn
 
-        # Attention projections — MLX nn.Linear stores weight as (out, in), matching HF's layout
-        layer.self_attn.q_proj.weight = _to_mlx(state_dict.pop(f"{pfx}.self_attn.q_proj.weight"))
-        layer.self_attn.k_proj.weight = _to_mlx(state_dict.pop(f"{pfx}.self_attn.k_proj.weight"))
-        layer.self_attn.v_proj.weight = _to_mlx(state_dict.pop(f"{pfx}.self_attn.v_proj.weight"))
-        layer.self_attn.o_proj.weight = _to_mlx(state_dict.pop(f"{pfx}.self_attn.o_proj.weight"))
+        # Fused QKV projection
+        q_wt = _to_mlx(state_dict.pop(f"{pfx}.self_attn.q_proj.weight"))
+        k_wt = _to_mlx(state_dict.pop(f"{pfx}.self_attn.k_proj.weight"))
+        v_wt = _to_mlx(state_dict.pop(f"{pfx}.self_attn.v_proj.weight"))
+        attn.qkv_proj.weight = mx.concatenate([q_wt, k_wt, v_wt], axis=0)
+        
+        # O projection
+        attn.o_proj.weight = _to_mlx(state_dict.pop(f"{pfx}.self_attn.o_proj.weight"))
 
         # QK norms are present for Qwen-style configs and absent for Llama-style configs.
         q_norm_key = f"{pfx}.self_attn.q_norm.weight"
         k_norm_key = f"{pfx}.self_attn.k_norm.weight"
-        if layer.self_attn.q_norm is not None and layer.self_attn.k_norm is not None:
-            layer.self_attn.q_norm.weight = _to_mlx(state_dict.pop(q_norm_key))
-            layer.self_attn.k_norm.weight = _to_mlx(state_dict.pop(k_norm_key))
+        if attn.q_norm is not None and attn.k_norm is not None:
+            attn.q_norm.weight = _to_mlx(state_dict.pop(q_norm_key))
+            attn.k_norm.weight = _to_mlx(state_dict.pop(k_norm_key))
         else:
             state_dict.pop(q_norm_key, None)
             state_dict.pop(k_norm_key, None)
@@ -69,9 +74,12 @@ def load_qwen3_weights(model: nn.Module, checkpoint_path: str | Path):
         layer.input_layernorm.weight = _to_mlx(state_dict.pop(f"{pfx}.input_layernorm.weight"))
         layer.post_attention_layernorm.weight = _to_mlx(state_dict.pop(f"{pfx}.post_attention_layernorm.weight"))
 
-        # MLP
-        layer.mlp.gate_proj.weight = _to_mlx(state_dict.pop(f"{pfx}.mlp.gate_proj.weight"))
-        layer.mlp.up_proj.weight = _to_mlx(state_dict.pop(f"{pfx}.mlp.up_proj.weight"))
+        # Fused MLP gate/up projection
+        gate_wt = _to_mlx(state_dict.pop(f"{pfx}.mlp.gate_proj.weight"))
+        up_wt = _to_mlx(state_dict.pop(f"{pfx}.mlp.up_proj.weight"))
+        layer.mlp.gate_up_proj.weight = mx.concatenate([gate_wt, up_wt], axis=0)
+        
+        # MLP down projection
         layer.mlp.down_proj.weight = _to_mlx(state_dict.pop(f"{pfx}.mlp.down_proj.weight"))
 
     if state_dict:

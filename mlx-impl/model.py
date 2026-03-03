@@ -10,6 +10,86 @@ if TYPE_CHECKING:
 
 
 # ---------------------------------------------------------------------------
+# Metal Kernels
+# ---------------------------------------------------------------------------
+
+_fused_log_softmax_source = """
+    constexpr int M = 4;
+    constexpr int block = 1024 * M;
+    constexpr int full_blocks = V / block;
+    constexpr int extra = V - full_blocks * block;
+    threadgroup float shared[32];
+    uint row = threadgroup_position_in_grid.y;
+    uint tid = thread_index_in_threadgroup;
+    uint simd_lane_id = thread_index_in_simdgroup;
+    uint simd_group_id = simdgroup_index_in_threadgroup;
+    logits += row * V; out += row * V;
+    float inv_temp = 1.0f / temp[0];
+    float thread_max = -1e30f;
+    int offset = tid * M;
+    for (int i = 0; i < full_blocks; i++) {
+        for (int j = 0; j < M; j++) thread_max = max(thread_max, static_cast<float>(logits[offset+j]) * inv_temp);
+        offset += block;
+    }
+    if (extra > 0) {
+        for (int j = 0; j < M; j++) if (offset+j < V) thread_max = max(thread_max, static_cast<float>(logits[offset+j]) * inv_temp);
+    }
+    float simd_max_val = simd_max(thread_max);
+    if (simd_lane_id == 0) shared[simd_group_id] = simd_max_val;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (simd_group_id == 0) { float v = shared[simd_lane_id]; v = simd_max(v); if (simd_lane_id == 0) shared[0] = v; }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    float row_max = shared[0];
+    float sum_exp = 0.0f; offset = tid * M;
+    for (int i = 0; i < full_blocks; i++) {
+        for (int j = 0; j < M; j++) sum_exp += metal::fast::exp(static_cast<float>(logits[offset+j]) * inv_temp - row_max);
+        offset += block;
+    }
+    if (extra > 0) {
+        for (int j = 0; j < M; j++) if (offset+j < V) sum_exp += metal::fast::exp(static_cast<float>(logits[offset+j]) * inv_temp - row_max);
+    }
+    sum_exp = simd_sum(sum_exp);
+    if (simd_lane_id == 0) shared[simd_group_id] = sum_exp;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (simd_group_id == 0) { float v = shared[simd_lane_id]; v = simd_sum(v); if (simd_lane_id == 0) shared[0] = v; }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    float log_sum_exp = metal::fast::log(shared[0]);
+    T lse = static_cast<T>(row_max + log_sum_exp);
+    offset = tid * M;
+    for (int i = 0; i < full_blocks; i++) {
+        for (int j = 0; j < M; j++) out[offset+j] = static_cast<T>(static_cast<float>(logits[offset+j]) * inv_temp) - lse;
+        offset += block;
+    }
+    if (extra > 0) {
+        for (int j = 0; j < M; j++) if (offset+j < V) out[offset+j] = static_cast<T>(static_cast<float>(logits[offset+j]) * inv_temp) - lse;
+    }
+"""
+
+_fused_log_softmax_kernel = mx.fast.metal_kernel(
+    name="fused_log_softmax",
+    input_names=["logits", "temp"],
+    output_names=["out"],
+    source=_fused_log_softmax_source,
+    ensure_row_contiguous=True,
+)
+
+
+def fused_log_softmax(logits: mx.array, temperature: float = 1.0) -> mx.array:
+    """Fast non-differentiable log-softmax kernel for rollouts."""
+    V = logits.shape[-1]
+    flat = logits.reshape(-1, V)
+    res = _fused_log_softmax_kernel(
+        inputs=[flat, mx.array([temperature], dtype=mx.float32)],
+        output_shapes=[flat.shape],
+        output_dtypes=[logits.dtype],
+        template=[("T", logits.dtype), ("V", V)],
+        grid=(1024, flat.shape[0], 1),
+        threadgroup=(1024, 1, 1),
+    )[0]
+    return res.reshape(logits.shape)
+
+
+# ---------------------------------------------------------------------------
 # Fused reshape + transpose + RMSNorm + RoPE Metal kernel
 # ---------------------------------------------------------------------------
 # Fuses four ops into a single GPU pass:
@@ -202,6 +282,15 @@ def fused_rope(
     )[0]
 
 
+def _rope_workaround(x, dims, theta, offset, traditional=False):
+    # mx.fast.rope is buggy for S=1 with B>1: batch item b gets position offset+b instead of offset
+    # Workaround: pass offset as a tensor of shape (B,) with identical values
+    if x.shape[2] == 1 and x.shape[0] > 1:
+        offsets = mx.full((x.shape[0],), offset, dtype=mx.int32)
+        return mx.fast.rope(x, dims, traditional=traditional, base=theta, scale=1.0, offset=offsets)
+    return mx.fast.rope(x, dims, traditional=traditional, base=theta, scale=1.0, offset=offset)
+
+
 # ---------------------------------------------------------------------------
 # Baseline (separate MLX ops) for benchmarking
 # ---------------------------------------------------------------------------
@@ -220,7 +309,7 @@ def baseline_norm_rope(
     b, s, _ = proj_out.shape
     x = proj_out.reshape(b, s, num_heads, head_dim).transpose(0, 2, 1, 3)
     x = mx.fast.rms_norm(x, norm_weight, eps)
-    return mx.fast.rope(x, head_dim, traditional=rope_traditional, base=rope_theta, scale=1.0, offset=offset)
+    return _rope_workaround(x, head_dim, rope_theta, offset, traditional=rope_traditional)
 
 
 def baseline_rope(
@@ -233,7 +322,7 @@ def baseline_rope(
 ) -> mx.array:
     b, s, _ = proj_out.shape
     x = proj_out.reshape(b, s, num_heads, head_dim).transpose(0, 2, 1, 3)
-    return mx.fast.rope(x, head_dim, traditional=rope_traditional, base=rope_theta, scale=1.0, offset=offset)
+    return _rope_workaround(x, head_dim, rope_theta, offset, traditional=rope_traditional)
 
 
 class RMSNorm(nn.Module):
@@ -246,15 +335,16 @@ class RMSNorm(nn.Module):
         return mx.fast.rms_norm(x, self.weight, self.eps)
 
 
-class SwiGLU(nn.Module):
+class MLP(nn.Module):
     def __init__(self, dim: int, intermediate_size: int):
         super().__init__()
-        self.gate_proj = nn.Linear(dim, intermediate_size, bias=False)
-        self.up_proj = nn.Linear(dim, intermediate_size, bias=False)
+        self.gate_up_proj = nn.Linear(dim, 2 * intermediate_size, bias=False)
         self.down_proj = nn.Linear(intermediate_size, dim, bias=False)
 
     def __call__(self, x: mx.array) -> mx.array:
-        return self.down_proj(nn.silu(self.gate_proj(x)) * self.up_proj(x))
+        gu = self.gate_up_proj(x)
+        gate, up = mx.split(gu, 2, axis=-1)
+        return self.down_proj(nn.silu(gate) * up)
 
 
 class Attention(nn.Module):
@@ -278,12 +368,9 @@ class Attention(nn.Module):
         self.eps = eps
         self.rope_theta = rope_theta
         self.rope_traditional = rope_traditional
-        self.n_rep = num_heads // num_kv_heads
         self.scale = head_dim**-0.5
 
-        self.q_proj = nn.Linear(dim, num_heads * head_dim, bias=False)
-        self.k_proj = nn.Linear(dim, num_kv_heads * head_dim, bias=False)
-        self.v_proj = nn.Linear(dim, num_kv_heads * head_dim, bias=False)
+        self.qkv_proj = nn.Linear(dim, (num_heads + 2 * num_kv_heads) * head_dim, bias=False)
         self.o_proj = nn.Linear(num_heads * head_dim, dim, bias=False)
         if use_qk_norm:
             self.q_norm = RMSNorm(head_dim, eps=eps)
@@ -299,33 +386,35 @@ class Attention(nn.Module):
         layer_idx: int,
         cache: KVCache | None = None,
     ) -> tuple[mx.array, KVCache | None]:
-        b, s, _d = x.shape
-
+        b, s, _ = x.shape
         offset = 0 if cache is None else cache.get_seq_len(layer_idx)
+
+        # Fused projection for efficiency
+        qkv = self.qkv_proj(x)
+
+        # Split into Q, K, V
+        q_size = self.num_heads * self.head_dim
+        k_size = self.num_kv_heads * self.head_dim
+        q = qkv[..., :q_size]
+        k = qkv[..., q_size : q_size + k_size]
+        v = qkv[..., q_size + k_size :]
+
         if self.use_qk_norm:
-            # Fused reshape + transpose + RMSNorm + RoPE via custom Metal kernel.
-            q = fused_norm_rope(
-                self.q_proj(x),
-                self.q_norm.weight,
-                self.num_heads,
-                self.head_dim,
-                offset,
-                self.rope_theta,
-            )
-            k = fused_norm_rope(
-                self.k_proj(x),
-                self.k_norm.weight,
-                self.num_kv_heads,
-                self.head_dim,
-                offset,
-                self.rope_theta,
-            )
+            # Note: fused kernels are available but MLX native ops are often faster
+            # We keep the custom kernels for benchmarking but default to native MLX with workaround
+            q = q.reshape(b, s, self.num_heads, self.head_dim).transpose(0, 2, 1, 3)
+            k = k.reshape(b, s, self.num_kv_heads, self.head_dim).transpose(0, 2, 1, 3)
+            q = self.q_norm(q)
+            k = self.k_norm(k)
+            q = _rope_workaround(q, self.head_dim, self.rope_theta, offset, traditional=self.rope_traditional)
+            k = _rope_workaround(k, self.head_dim, self.rope_theta, offset, traditional=self.rope_traditional)
         else:
-            q = self.q_proj(x).reshape(b, s, self.num_heads, self.head_dim).transpose(0, 2, 1, 3)
-            k = self.k_proj(x).reshape(b, s, self.num_kv_heads, self.head_dim).transpose(0, 2, 1, 3)
-            q = mx.fast.rope(q, self.head_dim, traditional=self.rope_traditional, base=self.rope_theta, scale=1.0, offset=offset)
-            k = mx.fast.rope(k, self.head_dim, traditional=self.rope_traditional, base=self.rope_theta, scale=1.0, offset=offset)
-        v = self.v_proj(x).reshape(b, s, self.num_kv_heads, self.head_dim).transpose(0, 2, 1, 3)
+            q = q.reshape(b, s, self.num_heads, self.head_dim).transpose(0, 2, 1, 3)
+            k = k.reshape(b, s, self.num_kv_heads, self.head_dim).transpose(0, 2, 1, 3)
+            q = _rope_workaround(q, self.head_dim, self.rope_theta, offset, traditional=self.rope_traditional)
+            k = _rope_workaround(k, self.head_dim, self.rope_theta, offset, traditional=self.rope_traditional)
+
+        v = v.reshape(b, s, self.num_kv_heads, self.head_dim).transpose(0, 2, 1, 3)
 
         if cache is not None:
             k, v = cache.update(k, v, layer_idx)
@@ -362,7 +451,7 @@ class DecoderLayer(nn.Module):
             rope_traditional=rope_traditional,
         )
         self.post_attention_layernorm = RMSNorm(dim, eps=eps)
-        self.mlp = SwiGLU(dim, intermediate_size)
+        self.mlp = MLP(dim, intermediate_size)
 
     def __call__(
         self,
@@ -428,13 +517,12 @@ class Qwen3(nn.Module):
         self,
         tokens: mx.array,
         cache: KVCache | None = None,
-        cur_pos: int = 0,
     ) -> tuple[mx.array, KVCache | None]:
         _b, s = tokens.shape
         x = self.embed_tokens(tokens)
 
         # Fast kernels use "causal" mask string for automatic causal masking
-        mask = "causal"
+        mask = "causal" if s > 1 else None
 
         for i, layer in enumerate(self.layers):
             x, cache = layer(x, mask, i, cache)

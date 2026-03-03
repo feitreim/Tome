@@ -9,7 +9,7 @@ import socket
 import sys
 import time
 from concurrent import futures
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING
 from urllib import request as urlrequest
@@ -41,7 +41,7 @@ class ActiveSequence:
     tokens: list[int]
     temperature: float
     max_tokens: int
-    cache_position: int
+    cache: KVCache = field(default_factory=lambda: None)
     is_finished: bool = False
 
 
@@ -102,8 +102,10 @@ class InferenceNodeServicer(inference_pb2_grpc.InferenceNodeServicer):
 
             # Run prefill through model
             t0 = time.perf_counter()
-            logits, cache = self.model(tokens, cache=cache, cur_pos=0)
+            logits, cache = self.model(tokens, cache=cache)
             mx.eval(logits)  # Ensure computation is complete
+            cache.advance(num_tokens)
+            
             elapsed = time.perf_counter() - t0
             tps = num_tokens / elapsed if elapsed > 0 else float("inf")
             logger.info(f"Prefill {request.request_id}: {num_tokens} tokens in {elapsed:.3f}s ({tps:.1f} tok/s)")
@@ -115,21 +117,20 @@ class InferenceNodeServicer(inference_pb2_grpc.InferenceNodeServicer):
                 next_token = int(mx.argmax(logits[0, -1]))
 
             # Track sequence
-            cache_position = len(request.tokens)
             seq = ActiveSequence(
                 request_id=request.request_id,
                 tokens=[*list(request.tokens), next_token],
                 temperature=request.temperature,
                 max_tokens=request.max_tokens,
-                cache_position=cache_position,
+                cache=cache,
             )
             self.active_sequences[request.request_id] = seq
-            self.total_cached_tokens += cache_position
+            self.total_cached_tokens += num_tokens
 
             return inference_pb2.PrefillResponse(
                 request_id=request.request_id,
                 next_token_id=next_token,
-                cache_position=cache_position,
+                cache_position=num_tokens,
             )
 
         except Exception as e:
@@ -153,14 +154,15 @@ class InferenceNodeServicer(inference_pb2_grpc.InferenceNodeServicer):
             # Get last token
             last_token = mx.array(np.array([[seq.tokens[-1]]]), dtype=mx.uint32)
 
-            # Need to recreate cache from scratch for now
-            # In production, we'd store the cache with the sequence
-            cache = self._create_cache()
+            # Use stored cache
+            cache = seq.cache
 
             # Run single decode step
             t0 = time.perf_counter()
-            logits, cache = self.model(last_token, cache=cache, cur_pos=seq.cache_position)
+            logits, cache = self.model(last_token, cache=cache)
             mx.eval(logits)
+            cache.advance(1)
+            
             elapsed = time.perf_counter() - t0
             tps = 1.0 / elapsed if elapsed > 0 else float("inf")
 
@@ -172,7 +174,6 @@ class InferenceNodeServicer(inference_pb2_grpc.InferenceNodeServicer):
 
             # Update sequence
             seq.tokens.append(next_token)
-            seq.cache_position += 1
             seq.is_finished = len(seq.tokens) >= seq.max_tokens or next_token == self.eos_token_id
 
             logger.info(f"Decode {request.request_id}: token={next_token} ({tps:.1f} tok/s, finished={seq.is_finished})")
@@ -203,8 +204,10 @@ class InferenceNodeServicer(inference_pb2_grpc.InferenceNodeServicer):
             cache = self._create_cache()
 
             t0 = time.perf_counter()
-            logits, cache = self.model(tokens, cache=cache, cur_pos=0)
+            logits, cache = self.model(tokens, cache=cache)
             mx.eval(logits)
+            cache.advance(num_input_tokens)
+            
             prefill_elapsed = time.perf_counter() - t0
             prefill_tps = num_input_tokens / prefill_elapsed if prefill_elapsed > 0 else float("inf")
             logger.info(f"StreamGenerate {request.request_id} prefill: {num_input_tokens} tokens in {prefill_elapsed:.3f}s ({prefill_tps:.1f} tok/s)")
@@ -215,7 +218,6 @@ class InferenceNodeServicer(inference_pb2_grpc.InferenceNodeServicer):
             else:
                 next_token = int(mx.argmax(logits[0, -1]))
 
-            cache_position = len(request.tokens)
             generated_tokens = [next_token]
 
             # Yield first token
@@ -231,8 +233,10 @@ class InferenceNodeServicer(inference_pb2_grpc.InferenceNodeServicer):
                 last_token = mx.array([[generated_tokens[-1]]], dtype=mx.uint32)
 
                 t0 = time.perf_counter()
-                logits, cache = self.model(last_token, cache=cache, cur_pos=cache_position)
+                logits, cache = self.model(last_token, cache=cache)
                 mx.eval(logits)
+                cache.advance(1)
+                
                 step_elapsed = time.perf_counter() - t0
                 step_tps = 1.0 / step_elapsed if step_elapsed > 0 else float("inf")
 
@@ -242,7 +246,6 @@ class InferenceNodeServicer(inference_pb2_grpc.InferenceNodeServicer):
                     next_token = int(mx.argmax(logits[0, 0]))
 
                 generated_tokens.append(next_token)
-                cache_position += 1
 
                 is_finished = next_token == self.eos_token_id or len(generated_tokens) >= request.max_tokens
 

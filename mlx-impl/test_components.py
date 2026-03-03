@@ -6,10 +6,10 @@ from pathlib import Path
 import mlx.core as mx
 import numpy as np
 
-MODEL_NAME = "Nanbeige/Nanbeige4.1-3B"
+MODEL_NAME = "Qwen/Qwen3-0.6B"
 SEQ_LEN = 32
 ATOL = 0.1  # bf16 accumulation across multi-layer matmuls
-ATOL_FULL = 2.0  # accumulated error across 32 decoder layers
+ATOL_FULL = 2.0  # accumulated error across 28 decoder layers
 TEST_DATA_DIR = Path(__file__).parent / "test_inputs"
 
 
@@ -18,18 +18,18 @@ def _get_our_model(checkpoint_path: str):
     from model import Qwen3
 
     model = Qwen3(
-        vocab_size=166144,
-        dim=2560,
-        num_layers=32,
-        num_heads=20,
-        num_kv_heads=4,
+        vocab_size=151936,
+        dim=1024,
+        num_layers=28,
+        num_heads=16,
+        num_kv_heads=8,
         head_dim=128,
-        intermediate_size=10496,
-        max_seq_len=262144,
-        rope_theta=70000000.0,
-        eps=1e-5,
-        tie_word_embeddings=False,
-        use_qk_norm=False,
+        intermediate_size=3072,
+        max_seq_len=40960,
+        rope_theta=1000000.0,
+        eps=1e-6,
+        tie_word_embeddings=True,
+        use_qk_norm=True,
         rope_traditional=False,
     )
     load_qwen3_weights(model, checkpoint_path)
@@ -66,7 +66,7 @@ def test_rmsnorm(our_model):
     embeddings = np.load(TEST_DATA_DIR / "embeddings.npy")
     hf_rmsnorm = np.load(TEST_DATA_DIR / "rmsnorm_layer0.npy")
 
-    x_mlx = mx.array(embeddings).astype(mx.bfloat16)
+    x_mlx = mx.array(embeddings).astype(mx.float16)
     our_out = our_model.layers[0].input_layernorm(x_mlx)
     our_np = np.array(our_out.astype(mx.float32))
 
@@ -79,7 +79,7 @@ def test_attention_layer(our_model):
     rmsnorm_out = np.load(TEST_DATA_DIR / "rmsnorm_layer0.npy")
     hf_attention = np.load(TEST_DATA_DIR / "attention_layer0.npy")
 
-    normed_mlx = mx.array(rmsnorm_out).astype(mx.bfloat16)
+    normed_mlx = mx.array(rmsnorm_out).astype(mx.float16)
     mask = "causal"
     our_attn_out, _ = our_model.layers[0].self_attn(normed_mlx, mask, layer_idx=0, cache=None)
     mx.eval(our_attn_out)
@@ -94,7 +94,7 @@ def test_mlp_layer(our_model):
     mlp_input = np.load(TEST_DATA_DIR / "mlp_input_layer0.npy")
     hf_mlp = np.load(TEST_DATA_DIR / "mlp_output_layer0.npy")
 
-    mlp_input_mlx = mx.array(mlp_input).astype(mx.bfloat16)
+    mlp_input_mlx = mx.array(mlp_input).astype(mx.float16)
     our_mlp_out = our_model.layers[0].mlp(mlp_input_mlx)
     mx.eval(our_mlp_out)
     our_np = np.array(our_mlp_out.astype(mx.float32))
@@ -108,7 +108,7 @@ def test_full_model_output(our_model):
     tokens = np.load(TEST_DATA_DIR / "tokens.npy")
     hf_logits = np.load(TEST_DATA_DIR / "full_model_logits.npy")
 
-    our_logits, _ = our_model(mx.array(tokens), cache=None, cur_pos=0)
+    our_logits, _ = our_model(mx.array(tokens), cache=None)
     mx.eval(our_logits)
     our_logits_np = np.array(our_logits.astype(mx.float32))
 

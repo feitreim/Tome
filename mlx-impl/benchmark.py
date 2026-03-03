@@ -59,13 +59,13 @@ def bench_prefill(model: Qwen3, seq_len: int) -> float:
     tokens = random_tokens(seq_len)
 
     for _ in range(WARMUP_ITERS):
-        logits, _ = model(tokens, cache=None, cur_pos=0)
+        logits, _ = model(tokens, cache=None)
         mx.eval(logits)
 
     times: list[float] = []
     for _ in range(BENCH_ITERS):
         t0 = time.perf_counter()
-        logits, _ = model(tokens, cache=None, cur_pos=0)
+        logits, _ = model(tokens, cache=None)
         mx.eval(logits)
         times.append(time.perf_counter() - t0)
 
@@ -77,32 +77,30 @@ def bench_decode(model: Qwen3, prompt_len: int = 32, gen_tokens: int = DECODE_TO
     prompt = random_tokens(prompt_len)
 
     cache = KVCache(NUM_LAYERS, NUM_KV_HEADS, HEAD_DIM, MAX_SEQ_LEN)
-    logits, cache = model(prompt, cache=cache, cur_pos=0)
+    logits, cache = model(prompt, cache=cache)
     mx.eval(logits)
     cache.advance(prompt_len)
     next_token = mx.argmax(logits[:, -1, :], axis=-1, keepdims=True)
 
     # Warmup decode steps
     warmup_cache = KVCache(NUM_LAYERS, NUM_KV_HEADS, HEAD_DIM, MAX_SEQ_LEN)
-    logits_w, warmup_cache = model(prompt, cache=warmup_cache, cur_pos=0)
+    logits_w, warmup_cache = model(prompt, cache=warmup_cache)
     mx.eval(logits_w)
     warmup_cache.advance(prompt_len)
     tok = mx.argmax(logits_w[:, -1, :], axis=-1, keepdims=True)
-    for i in range(min(5, gen_tokens)):
-        logits_w, warmup_cache = model(tok, cache=warmup_cache, cur_pos=prompt_len + i)
+    for _ in range(min(5, gen_tokens)):
+        logits_w, warmup_cache = model(tok, cache=warmup_cache)
         mx.eval(logits_w)
         warmup_cache.advance(1)
         tok = mx.argmax(logits_w[:, -1, :], axis=-1, keepdims=True)
 
     # Timed decode
     t0 = time.perf_counter()
-    cur_pos = prompt_len
     for _ in range(gen_tokens):
-        logits, cache = model(next_token, cache=cache, cur_pos=cur_pos)
+        logits, cache = model(next_token, cache=cache)
         mx.eval(logits)
         cache.advance(1)
         next_token = mx.argmax(logits[:, -1, :], axis=-1, keepdims=True)
-        cur_pos += 1
     total = time.perf_counter() - t0
 
     return gen_tokens / total
