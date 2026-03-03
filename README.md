@@ -61,9 +61,12 @@ curl -X POST http://localhost:8080/v1/grpo/judge \
 
 ```bash
 # Run End-to-End GRPO pipeline test and benchmark
-uv run --with httpx tests/e2e_grpo.py
+uv run tests/e2e_grpo.py
 
-# Run MLX unit tests
+# Expected Output (approximate):
+# --- BENCHMARK ---
+# rollout + ref_lps Throughput: 136.0 tokens/s (aggregate)
+# Judge Throughput: 4.3 items/s
 uv run python3 mlx-impl/tests/test_kvcache.py
 uv run python3 mlx-impl/tests/test_grpo.py
 

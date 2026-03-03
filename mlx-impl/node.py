@@ -195,13 +195,28 @@ class InferenceNodeServicer(inference_pb2_grpc.InferenceNodeServicer):
             chunk_prompts = request.prompts[i : i + max_concurrent_prompts]
             logger.info(f"Processing rollout chunk: prompts {i} to {i + len(chunk_prompts)} (Batch Size: {len(chunk_prompts) * G})")
 
+            t0 = time.perf_counter()
             chunk_results = await self._process_rollout_chunk(
                 chunk_prompts, G, request.temperature, request.max_tokens
             )
+            t1 = time.perf_counter()
+
+            # Calculate tokens generated
+            num_rollout_tokens = sum(len(res.completions[g].tokens) for res in chunk_results for g in range(G))
+            elapsed = t1 - t0
+            tps = num_rollout_tokens / elapsed if elapsed > 0 else 0
+            logger.info(f"Rollout chunk completed: {num_rollout_tokens} tokens in {elapsed:.2f}s ({tps:.1f} tok/s)")
 
             # Phase 2: Reference Model log-probs (Batched)
             logger.info(f"Processing ref log-probs chunk: prompts {i} to {i + len(chunk_prompts)}")
+            t0_ref = time.perf_counter()
             await self._process_ref_logprobs_batched(chunk_prompts, chunk_results, G)
+            t1_ref = time.perf_counter()
+
+            num_ref_tokens = sum(len(res.completions[g].tokens) for res in chunk_results for g in range(G))
+            elapsed_ref = t1_ref - t0_ref
+            tps_ref = num_ref_tokens / elapsed_ref if elapsed_ref > 0 else 0
+            logger.info(f"Ref log-probs chunk completed: {num_ref_tokens} tokens in {elapsed_ref:.2f}s ({tps_ref:.1f} tok/s)")
 
             all_results.extend(chunk_results)
 
@@ -233,6 +248,9 @@ class InferenceNodeServicer(inference_pb2_grpc.InferenceNodeServicer):
             self.prefix_cache.insert(rubric_tokens, rubric_cache.block_tables[0])
 
         results = []
+        total_verdict_tokens = 0
+        t0_judge = time.perf_counter()
+
         # Process judge items
         # Rely on prefix caching for efficiency across items sharing prompts
         for item in request.items:
@@ -289,6 +307,11 @@ class InferenceNodeServicer(inference_pb2_grpc.InferenceNodeServicer):
                 verdict_tokens=verdict_tokens,
                 log_probs=verdict_log_probs
             ))
+            total_verdict_tokens += len(verdict_tokens)
+
+        elapsed_judge = time.perf_counter() - t0_judge
+        tps_judge = total_verdict_tokens / elapsed_judge if elapsed_judge > 0 else 0
+        logger.info(f"Judge request completed: {len(request.items)} items, {total_verdict_tokens} tokens in {elapsed_judge:.2f}s ({tps_judge:.1f} tok/s)")
 
         return inference_pb2.JudgeResponse(batch_id=batch_id, results=results)
 
