@@ -1,6 +1,15 @@
 # Tome
 
-MLX implementation of Nanbeige4.1-3B, a dense decoder-only transformer with Grouped Query Attention, optimized for Apple Silicon.
+Distributed LLM inference and **GRPO training infrastructure** for Apple Silicon, featuring Paged KV Cache and Prefix Caching.
+
+## Features
+
+- **Optimized for GRPO**: Unified rollout-judge-train pipeline with multi-level prefix caching.
+- **Paged KV Cache**: 128-token block-based memory management with Copy-on-Write (CoW).
+- **Prefix Caching**: Radix-tree based KV reuse for shared rubrics and prompts.
+- **Dual Model Architecture**: Policy and Reference models live in unified memory for instant log-prob computation.
+- **In-place Weight Updates**: Merge LoRA adapters via RPC without reloads.
+- **Distributed Scheduler**: Rust-based orchestrator with prefix-aware routing.
 
 ## Installation
 
@@ -16,88 +25,49 @@ Start the scheduler, inference node, and TUI in three terminals:
 # Terminal 1: Scheduler (Rust HTTP server, routes requests to nodes)
 ./start_scheduler.sh
 
-# Terminal 2: MLX inference node (gRPC server, runs the model)
+# Terminal 2: MLX inference node (gRPC server, runs Qwen3-0.6B by default)
 ./start_node.sh
 
 # Terminal 3: TUI (interactive chat interface)
 ./start_tui.sh
 ```
 
-Register the node with the scheduler (You shouldn't need to do this):
+### GRPO Training iteration (example)
 
 ```bash
-curl -X POST http://localhost:8080/v1/nodes \
+curl -X POST http://localhost:8080/v1/grpo \
   -H "Content-Type: application/json" \
-  -d '{"addr": "http://localhost:50052"}'
+  -d '{
+    "batch_id": "iter-1",
+    "prompts": [{"prompt_id": "p1", "prompt": "Write a poem about tensors."}],
+    "group_size": 8,
+    "judge": {"rubric": "Technical accuracy and rhyme.", "temperature": 0.0, "max_tokens": 1}
+  }'
 ```
 
 ### Tests & Benchmarks
 
 ```bash
-# Run component tests against HuggingFace reference
-uv run mlx-impl/test_components.py
+# Run paged KV and CoW tests
+uv run python3 mlx-impl/test_kvcache_batched.py
 
-# Measure KL divergence vs HuggingFace
-uv run mlx-impl/measure_kl_div.py
+# Run full GRPO pipeline test
+uv run python3 mlx-impl/test_grpo_rpc.py
 
-# Benchmark inference
-uv run mlx-impl/benchmark.py
+# Benchmark inference (defaults to Qwen3-0.6B)
+uv run python3 mlx-impl/benchmark.py
 ```
-
-First run will download the Nanbeige4.1-3B checkpoint from HuggingFace.
-
-## OpenCode
-
-To use Tome as a backend for [OpenCode](https://opencode.ai), add this to `~/.config/opencode/opencode.json`:
-
-```json
-{
-  "$schema": "https://opencode.ai/config.json",
-  "provider": {
-    "tome": {
-      "npm": "@ai-sdk/openai-compatible",
-      "name": "Tome (local)",
-      "options": {
-        "baseURL": "http://localhost:8080/v1"
-      },
-      "models": {
-        "Nanbeige/Nanbeige4.1-3B": {
-          "name": "Nanbeige4.1-3B (Tome MLX)",
-          "limit": {
-            "context": 262144,
-            "output": 4096
-          }
-        }
-      }
-    }
-  }
-}
-```
-
-Then start the scheduler and node, and select the Tome provider in OpenCode.
 
 ## Project Structure
 
-- `mlx-impl/model.py` - Nanbeige4.1-3B model implementation using MLX
-- `mlx-impl/load_weights.py` - HuggingFace checkpoint loading
-- `mlx-impl/kvcache.py` - KV cache for autoregressive generation
-- `mlx-impl/node.py` - gRPC inference node server
-- `mlx-impl/test_components.py` - Validation tests vs HuggingFace Transformers
-- `mlx-impl/measure_kl_div.py` - KL divergence measurement
-- `mlx-impl/benchmark.py` - Inference benchmarks
-- `mlx-impl/benchmark_kernel.py` - Metal kernel microbenchmarks
-- `scheduler/` - Rust inference scheduler
-- `tui/` - Ratatui interactive chat interface
+- `mlx-impl/node.py` - gRPC inference node server with GRPO support.
+- `mlx-impl/kvcache.py` - Paged KV cache with CoW and Prefix Cache.
+- `mlx-impl/model.py` - Qwen3/Nanbeige model implementation in MLX.
+- `scheduler/` - Rust inference scheduler and prefix-aware router.
+- `tui/` - Ratatui interactive chat interface.
 
-## Development
+## Documentation
 
-```bash
-# Lint
-uvx ruff check .
-
-# Format
-uvx ruff format .
-
-# Type check
-uvx ty check
-```
+- [Inference Server Architecture](INFERENCE_SERVER.md)
+- [MLX Implementation Details](mlx-impl/README.md)
+- [Scheduler API & Routing](scheduler/SCHEDULER.md)

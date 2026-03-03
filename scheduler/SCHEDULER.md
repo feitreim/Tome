@@ -137,10 +137,81 @@ List all registered nodes and their current status.
 }
 ```
 
-**Example:**
+### `POST /v1/grpo`
 
-```bash
-curl http://localhost:8080/v1/nodes
+Run a full GRPO training iteration chunk: rollouts, judge scoring, and reference log-probs.
+
+**Request:**
+
+```json
+{
+  "batch_id": "iteration-42",
+  "prompts": [
+    {"prompt_id": "p1", "prompt": "Explain quantum entanglement"},
+    {"prompt_id": "p2", "prompt": "What is the capital of France?"}
+  ],
+  "group_size": 8,
+  "temperature": 0.7,
+  "max_tokens": 512,
+  "judge": {
+    "rubric": "Score based on clarity and correctness.",
+    "temperature": 0.0,
+    "max_tokens": 1
+  }
+}
+```
+
+**Response:**
+
+```json
+{
+  "batch_id": "iteration-42",
+  "results": [
+    {
+      "prompt_id": "p1",
+      "completions": [
+        {
+          "tokens": [123, 456, ...],
+          "log_probs": [-0.1, -0.2, ...],
+          "ref_log_probs": [-0.15, -0.22, ...],
+          "judge_score": 8.0
+        },
+        ...
+      ]
+    },
+    ...
+  ]
+}
+```
+
+### `POST /v1/weights`
+
+Broadcast in-place LoRA weight updates to all registered nodes.
+
+**Request:**
+
+```json
+{
+  "updates": [
+    {
+      "layer_idx": 0,
+      "param_name": "self_attn.q_proj",
+      "lora_a": "<base64-encoded-bf16-bits>",
+      "lora_b": "<base64-encoded-bf16-bits>",
+      "shape_a": [16, 1024],
+      "shape_b": [2048, 16]
+    }
+  ]
+}
+```
+
+**Response:**
+
+```json
+{
+  "http://localhost:50051": { "success": true, "version": 1 },
+  "http://localhost:50052": { "success": true, "version": 1 }
+}
 ```
 
 ## Request Routing
