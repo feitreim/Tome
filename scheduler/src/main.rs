@@ -12,7 +12,7 @@ use tracing::info;
 use crate::http_api::AppState;
 use crate::scheduler::Scheduler;
 
-const MODEL_ID: &str = "Nanbeige/Nanbeige4.1-3B";
+const MODEL_ID: &str = "Qwen/Qwen3-0.6B";
 
 #[tokio::main]
 async fn main() {

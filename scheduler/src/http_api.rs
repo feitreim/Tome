@@ -15,7 +15,7 @@ use uuid::Uuid;
 use crate::proto::GenerateRequest;
 use crate::scheduler::Scheduler;
 
-const MODEL_ID: &str = "Nanbeige/Nanbeige4.1-3B";
+const MODEL_ID: &str = "Qwen/Qwen3-0.6B";
 
 #[derive(Clone)]
 pub struct AppState {
