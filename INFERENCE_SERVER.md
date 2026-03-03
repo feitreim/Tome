@@ -54,12 +54,17 @@ Supports the `UpdateWeights` RPC to merge LoRA adapters ($B \times A$) directly 
 ### 1. Completions (`POST /v1/completions`)
 Standard OpenAI-compatible completion endpoint.
 
-### 2. GRPO Pipeline (`POST /v1/grpo`)
-Runs a full GRPO iteration chunk.
-- **Input**: Prompts, group size ($G$), judge rubric, and sampling parameters.
-- **Output**: completions with per-token log-probs, reference log-probs, and judge scores.
+### 2. GRPO Rollout (`POST /v1/grpo/rollout`)
+Generates multiple rollouts per prompt and computes both policy and reference model log-probs.
+- **Input**: Prompts, group size ($G$), and sampling parameters.
+- **Output**: completions with per-token log-probs and reference log-probs.
 
-### 3. Weight Update (`POST /v1/weights`)
+### 3. GRPO Judge (`POST /v1/grpo/judge`)
+Scores completions using a shared rubric and 3-level prefix caching.
+- **Input**: Shared rubric, prompts, and completions to score.
+- **Output**: Judge verdicts with per-token log-probs.
+
+### 4. Weight Update (`POST /v1/weights`)
 Updates the policy model weights on all nodes.
 - **Input**: List of layer indices, parameter names, and base64-encoded LoRA matrices ($A$ and $B$).
 

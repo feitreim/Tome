@@ -23,39 +23,53 @@ Start the scheduler, inference node, and TUI in three terminals:
 
 ```bash
 # Terminal 1: Scheduler (Rust HTTP server, routes requests to nodes)
-./start_scheduler.sh
+./scripts/start_scheduler.sh
 
 # Terminal 2: MLX inference node (gRPC server, runs Qwen3-0.6B by default)
-./start_node.sh
+./scripts/start_node.sh
 
 # Terminal 3: TUI (interactive chat interface)
-./start_tui.sh
+./scripts/start_tui.sh
 ```
 
 ### GRPO Training iteration (example)
 
+The GRPO API is split into **Rollout** (generates completions + ref logprobs) and **Judge** (scores completions):
+
 ```bash
-curl -X POST http://localhost:8080/v1/grpo \
+# 1. Rollout
+curl -X POST http://localhost:8080/v1/grpo/rollout \
   -H "Content-Type: application/json" \
   -d '{
     "batch_id": "iter-1",
     "prompts": [{"prompt_id": "p1", "prompt": "Write a poem about tensors."}],
     "group_size": 8,
-    "judge": {"rubric": "Technical accuracy and rhyme.", "temperature": 0.0, "max_tokens": 1}
+    "max_tokens": 128
+  }'
+
+# 2. Judge
+curl -X POST http://localhost:8080/v1/grpo/judge \
+  -H "Content-Type: application/json" \
+  -d '{
+    "batch_id": "iter-1",
+    "rubric": "Technical accuracy and rhyme.",
+    "items": [{"item_id": "i1", "prompt": "Prompt: Poem about tensors. Completion: ..."}]
   }'
 ```
 
 ### Tests & Benchmarks
 
 ```bash
-# Run paged KV and CoW tests
-uv run python3 mlx-impl/test_kvcache_batched.py
+# Run End-to-End GRPO pipeline test and benchmark
+uv run --with httpx tests/e2e_grpo.py
 
-# Run full GRPO pipeline test
-uv run python3 mlx-impl/test_grpo_rpc.py
+# Run MLX unit tests
+uv run python3 mlx-impl/tests/test_kvcache.py
+uv run python3 mlx-impl/tests/test_grpo.py
 
-# Benchmark inference (defaults to Qwen3-0.6B)
-uv run python3 mlx-impl/benchmark.py
+# Benchmark kernel and model performance
+uv run python3 mlx-impl/benchmarks/benchmark_kernel.py
+uv run python3 mlx-impl/benchmarks/benchmark.py
 ```
 
 ## Project Structure
@@ -63,7 +77,11 @@ uv run python3 mlx-impl/benchmark.py
 - `mlx-impl/node.py` - gRPC inference node server with GRPO support.
 - `mlx-impl/kvcache.py` - Paged KV cache with CoW and Prefix Cache.
 - `mlx-impl/model.py` - Qwen3/Nanbeige model implementation in MLX.
+- `mlx-impl/tests/` - Unit tests for MLX components.
+- `mlx-impl/benchmarks/` - Performance and comparison benchmarks.
 - `scheduler/` - Rust inference scheduler and prefix-aware router.
+- `tests/e2e_grpo.py` - System-wide end-to-end integration test.
+- `scripts/` - Convenience scripts for starting components.
 - `tui/` - Ratatui interactive chat interface.
 
 ## Documentation

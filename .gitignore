@@ -32,4 +32,4 @@ test_inputs/
 .DS_Store
 
 # grpc
-/generated/
+generated/
