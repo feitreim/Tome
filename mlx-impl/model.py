@@ -408,12 +408,13 @@ class Attention(nn.Module):
         v = qkv[..., q_size + k_size :]
 
         if self.use_qk_norm:
-            # Fused kernel combines reshape, transpose, RMSNorm and RoPE into a single pass
-            from model import fused_norm_rope
-            q = fused_norm_rope(q, self.q_norm.weight, self.num_heads, self.head_dim, offset, self.rope_theta)
-            k = fused_norm_rope(k, self.k_norm.weight, self.num_kv_heads, self.head_dim, offset, self.rope_theta)
+            q = q.reshape(b, s, self.num_heads, self.head_dim).transpose(0, 2, 1, 3)
+            k = k.reshape(b, s, self.num_kv_heads, self.head_dim).transpose(0, 2, 1, 3)
+            q = self.q_norm(q)
+            k = self.k_norm(k)
+            q = _rope_workaround(q, self.head_dim, self.rope_theta, offset, traditional=self.rope_traditional)
+            k = _rope_workaround(k, self.head_dim, self.rope_theta, offset, traditional=self.rope_traditional)
         else:
-            # Unfused fallback if QK norm is disabled
             q = q.reshape(b, s, self.num_heads, self.head_dim).transpose(0, 2, 1, 3)
             k = k.reshape(b, s, self.num_kv_heads, self.head_dim).transpose(0, 2, 1, 3)
             q = _rope_workaround(q, self.head_dim, self.rope_theta, offset, traditional=self.rope_traditional)
