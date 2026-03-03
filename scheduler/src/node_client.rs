@@ -3,8 +3,9 @@ use tonic::transport::Channel;
 use tracing::{info, warn};
 
 use crate::proto::{
-    inference_node_client::InferenceNodeClient, GenerateRequest, NodeStatus, PrefillRequest,
-    PrefillResponse, StatusRequest, TokenResponse,
+    inference_node_client::InferenceNodeClient, GenerateRequest, GrpoRequest, GrpoResponse,
+    NodeStatus, PrefillRequest, PrefillResponse, StatusRequest, TokenResponse, WeightUpdateRequest,
+    WeightUpdateResponse,
 };
 
 /// Cached status from the last health check.
@@ -50,6 +51,21 @@ impl NodeConnection {
     ) -> Result<tonic::Streaming<TokenResponse>, tonic::Status> {
         let mut client = self.client.lock().await;
         let resp = client.stream_generate(req).await?;
+        Ok(resp.into_inner())
+    }
+
+    pub async fn grpo(&self, req: GrpoRequest) -> Result<GrpoResponse, tonic::Status> {
+        let mut client = self.client.lock().await;
+        let resp = client.grpo(req).await?;
+        Ok(resp.into_inner())
+    }
+
+    pub async fn update_weights(
+        &self,
+        req: WeightUpdateRequest,
+    ) -> Result<WeightUpdateResponse, tonic::Status> {
+        let mut client = self.client.lock().await;
+        let resp = client.update_weights(req).await?;
         Ok(resp.into_inner())
     }
 

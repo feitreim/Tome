@@ -18,8 +18,8 @@ def download_qwen3(model_name: str = "Qwen/Qwen3-0.6B") -> str:
 
 
 def _to_mlx(tensor: torch.Tensor) -> mx.array:
-    # Use float16 as it's often faster on Metal, as noted in rl-values
-    return mx.array(tensor.to(torch.float32).numpy()).astype(mx.float16)
+    # Use bfloat16 to match original model and mlx-lm
+    return mx.array(tensor.to(torch.float32).numpy()).astype(mx.bfloat16)
 
 
 def load_qwen3_weights(model: nn.Module, checkpoint_path: str | Path):

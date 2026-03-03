@@ -7,6 +7,10 @@ service InferenceNode {
   rpc Decode(DecodeRequest) returns (DecodeResponse);
   rpc StreamGenerate(GenerateRequest) returns (stream TokenResponse);
   rpc GetStatus(StatusRequest) returns (NodeStatus);
+  
+  // GRPO Extensions
+  rpc GRPO(GRPORequest) returns (GRPOResponse);
+  rpc UpdateWeights(WeightUpdateRequest) returns (WeightUpdateResponse);
 }
 
 message PrefillRequest {
@@ -53,4 +57,62 @@ message NodeStatus {
   float gpu_utilization = 2;
   uint32 queue_depth = 3;
   uint64 cached_tokens = 4;
+}
+
+// Weight Management
+message WeightUpdateRequest {
+  repeated LayerUpdate updates = 1;
+}
+
+message LayerUpdate {
+  uint32 layer_idx = 1;
+  string param_name = 2;           // e.g. "self_attn.q_proj"
+  bytes lora_A = 3;                // (rank, in_dim) as bf16
+  bytes lora_B = 4;                // (out_dim, rank) as bf16
+  repeated uint32 shape_A = 5;
+  repeated uint32 shape_B = 6;
+}
+
+message WeightUpdateResponse {
+  bool success = 1;
+  uint64 policy_version = 2;       // monotonic version counter
+}
+
+// GRPO Training Loop
+message GRPORequest {
+  string batch_id = 1;
+  repeated Prompt prompts = 2;
+  uint32 group_size = 3;              // G rollouts per prompt
+  float temperature = 4;
+  uint32 max_tokens = 5;
+  uint32 max_concurrent = 6;          // memory budget: max prompts in flight
+  JudgeConfig judge = 7;
+}
+
+message Prompt {
+  string prompt_id = 1;
+  repeated uint32 tokens = 2;
+}
+
+message JudgeConfig {
+  repeated uint32 rubric_tokens = 1;  // shared rubric prefix
+  float temperature = 2;
+  uint32 max_tokens = 3;
+}
+
+message GRPOResponse {
+  string batch_id = 1;
+  repeated PromptResult results = 2;
+}
+
+message PromptResult {
+  string prompt_id = 1;
+  repeated CompletionResult completions = 2;
+}
+
+message CompletionResult {
+  repeated uint32 tokens = 1;
+  repeated float log_probs = 2;
+  float judge_score = 3;
+  repeated float ref_log_probs = 4;
 }

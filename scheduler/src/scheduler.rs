@@ -88,6 +88,29 @@ impl Scheduler {
         best_node
     }
 
+    /// Broadcast weight updates to all healthy nodes.
+    pub async fn broadcast_weight_update(
+        &self,
+        req: crate::proto::WeightUpdateRequest,
+    ) -> Vec<(NodeId, Result<crate::proto::WeightUpdateResponse, String>)> {
+        let nodes = self.nodes.read().await;
+        let mut results = Vec::with_capacity(nodes.len());
+
+        for (node_id, conn) in nodes.iter() {
+            let status = conn.status.read().await;
+            if !status.healthy {
+                results.push((node_id.clone(), Err("node unhealthy".to_string())));
+                continue;
+            }
+
+            match conn.update_weights(req.clone()).await {
+                Ok(resp) => results.push((node_id.clone(), Ok(resp))),
+                Err(e) => results.push((node_id.clone(), Err(e.to_string()))),
+            }
+        }
+        results
+    }
+
     /// Get status info for all registered nodes.
     pub async fn node_statuses(&self) -> Vec<NodeInfo> {
         let nodes = self.nodes.read().await;

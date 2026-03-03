@@ -27,6 +27,8 @@ pub fn router(state: AppState) -> Router {
     Router::new()
         .route("/v1/completions", post(completions))
         .route("/v1/chat/completions", post(chat_completions))
+        .route("/v1/grpo", post(grpo))
+        .route("/v1/weights", post(update_weights))
         .route("/v1/models", get(list_models))
         .route("/v1/nodes", get(list_nodes).post(register_node))
         .with_state(state)
@@ -397,4 +399,157 @@ async fn register_node(
         Ok(node_id) => Json(serde_json::json!({ "node_id": node_id, "status": "registered" })),
         Err(e) => Json(serde_json::json!({ "error": e })),
     }
+}
+
+// ---- GRPO API ----
+
+#[derive(Deserialize)]
+struct GrpoRequestJson {
+    batch_id: String,
+    prompts: Vec<GrpoPromptJson>,
+    group_size: u32,
+    #[serde(default = "default_temperature")]
+    temperature: f32,
+    #[serde(default = "default_grpo_max_tokens")]
+    max_tokens: u32,
+    max_concurrent: Option<u32>,
+    judge: JudgeConfigJson,
+}
+
+#[derive(Deserialize)]
+struct GrpoPromptJson {
+    prompt_id: String,
+    prompt: String,
+}
+
+#[derive(Deserialize)]
+struct JudgeConfigJson {
+    rubric: String,
+    #[serde(default = "default_temperature")]
+    temperature: f32,
+    #[serde(default = "default_grpo_max_tokens")]
+    max_tokens: u32,
+}
+
+fn default_grpo_max_tokens() -> u32 {
+    512
+}
+
+async fn grpo(
+    State(state): State<AppState>,
+    Json(req): Json<GrpoRequestJson>,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
+    let request_id = Uuid::new_v4().to_string();
+
+    // Encode rubric and prompts
+    let rubric_tokens = state
+        .tokenizer
+        .encode(req.judge.rubric.as_str(), false)
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({ "error": e.to_string() }))))?
+        .get_ids()
+        .to_vec();
+
+    let mut proto_prompts = Vec::new();
+    for p in req.prompts {
+        let tokens = state
+            .tokenizer
+            .encode(p.prompt.as_str(), false)
+            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({ "error": e.to_string() }))))?
+            .get_ids()
+            .to_vec();
+        proto_prompts.push(crate::proto::Prompt {
+            prompt_id: p.prompt_id,
+            tokens,
+        });
+    }
+
+    // Route based on rubric (shared prefix)
+    let (node_id, conn) = match state.scheduler.route_request(&rubric_tokens).await {
+        Some(pair) => pair,
+        None => {
+            return Err((
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(serde_json::json!({ "error": "no healthy inference nodes available" })),
+            ));
+        }
+    };
+
+    info!(request_id, node_id, "routing GRPO request");
+
+    let grpc_req = crate::proto::GrpoRequest {
+        batch_id: req.batch_id,
+        prompts: proto_prompts,
+        group_size: req.group_size,
+        temperature: req.temperature,
+        max_tokens: req.max_tokens,
+        max_concurrent: req.max_concurrent.unwrap_or(4),
+        judge: Some(crate::proto::JudgeConfig {
+            rubric_tokens,
+            temperature: req.judge.temperature,
+            max_tokens: req.judge.max_tokens,
+        }),
+    };
+
+    match conn.grpo(grpc_req).await {
+        Ok(resp) => Ok(Json(serde_json::to_value(resp).unwrap())),
+        Err(e) => Err((StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({ "error": e.to_string() })))),
+    }
+}
+
+// ---- Weight Update API ----
+
+#[derive(Deserialize)]
+struct WeightUpdateRequestJson {
+    updates: Vec<LayerUpdateJson>,
+}
+
+#[derive(Deserialize)]
+struct LayerUpdateJson {
+    layer_idx: u32,
+    param_name: String,
+    lora_a: String, // base64 encoded
+    lora_b: String, // base64 encoded
+    shape_a: Vec<u32>,
+    shape_b: Vec<u32>,
+}
+
+async fn update_weights(
+    State(state): State<AppState>,
+    Json(req): Json<WeightUpdateRequestJson>,
+) -> Json<serde_json::Value> {
+    use base64::{engine::general_purpose, Engine as _};
+
+    let mut proto_updates = Vec::new();
+    for u in req.updates {
+        let lora_a = general_purpose::STANDARD.decode(u.lora_a).unwrap_or_default();
+        let lora_b = general_purpose::STANDARD.decode(u.lora_b).unwrap_or_default();
+        proto_updates.push(crate::proto::LayerUpdate {
+            layer_idx: u.layer_idx,
+            param_name: u.param_name,
+            lora_a,
+            lora_b,
+            shape_a: u.shape_a,
+            shape_b: u.shape_b,
+        });
+    }
+
+    let grpc_req = crate::proto::WeightUpdateRequest {
+        updates: proto_updates,
+    };
+
+    let results = state.scheduler.broadcast_weight_update(grpc_req).await;
+    
+    let mut response_results = serde_json::Map::new();
+    for (node_id, res) in results {
+        match res {
+            Ok(resp) => {
+                response_results.insert(node_id, serde_json::json!({ "success": resp.success, "version": resp.policy_version }));
+            }
+            Err(e) => {
+                response_results.insert(node_id, serde_json::json!({ "error": e }));
+            }
+        }
+    }
+
+    Json(serde_json::Value::Object(response_results))
 }
