@@ -160,7 +160,7 @@ def _get_norm_rope_kernel(head_dim: int, eps: float = 1e-6, rope_base: float = 1
 
         // Write to (B, NH, S, HD) transposed layout
         uint out_idx = batch * (NH * S * {head_dim}) + head * (S * {head_dim}) + seq * {head_dim} + tid;
-        out[out_idx] = static_cast<bfloat16_t>(result);
+        out[out_idx] = static_cast<T>(result);
     """
 
     kernel = mx.fast.metal_kernel(
@@ -185,7 +185,7 @@ def fused_norm_rope(
     kernel = _get_norm_rope_kernel(head_dim, rope_base=rope_theta)
     return kernel(
         inputs=[proj_out, norm_weight, mx.array([s], dtype=mx.uint32), mx.array([offset], dtype=mx.uint32)],
-        template=[("NH", num_heads)],
+        template=[("NH", num_heads), ("T", proj_out.dtype)],
         grid=(b * num_heads * s * head_dim, 1, 1),
         threadgroup=(head_dim, 1, 1),
         output_shapes=[(b, num_heads, s, head_dim)],
@@ -249,7 +249,7 @@ def _get_rope_kernel(head_dim: int, rope_base: float = 1000000.0) -> Any:
 
         // Write to (B, NH, S, HD) transposed layout
         uint out_idx = batch * (NH * S * {head_dim}) + head * (S * {head_dim}) + seq * {head_dim} + tid;
-        out[out_idx] = static_cast<bfloat16_t>(result);
+        out[out_idx] = static_cast<T>(result);
     """
 
     kernel = mx.fast.metal_kernel(
@@ -273,7 +273,7 @@ def fused_rope(
     kernel = _get_rope_kernel(head_dim, rope_base=rope_theta)
     return kernel(
         inputs=[proj_out, mx.array([s], dtype=mx.uint32), mx.array([offset], dtype=mx.uint32)],
-        template=[("NH", num_heads)],
+        template=[("NH", num_heads), ("T", proj_out.dtype)],
         grid=(b * num_heads * s * head_dim, 1, 1),
         threadgroup=(head_dim, 1, 1),
         output_shapes=[(b, num_heads, s, head_dim)],
@@ -283,11 +283,19 @@ def fused_rope(
 
 
 def _rope_workaround(x, dims, theta, offset, traditional=False):
-    # mx.fast.rope is buggy for S=1 with B>1: batch item b gets position offset+b instead of offset
-    # Workaround: pass offset as a tensor of shape (B,) with identical values
+    # mx.fast.rope is buggy for S=1 with B>1 when offset is a scalar.
+    # If offset is an array of shape (B,), it works correctly.
+    if isinstance(offset, mx.array) and offset.ndim > 0:
+        return mx.fast.rope(x, dims, traditional=traditional, base=theta, scale=1.0, offset=offset)
+    
+    # Fallback/Workaround for scalar offset
     if x.shape[2] == 1 and x.shape[0] > 1:
-        offsets = mx.full((x.shape[0],), offset, dtype=mx.int32)
+        if isinstance(offset, mx.array):
+            offsets = mx.full((x.shape[0],), offset, dtype=mx.int32)
+        else:
+            offsets = mx.array([offset] * x.shape[0], dtype=mx.int32)
         return mx.fast.rope(x, dims, traditional=traditional, base=theta, scale=1.0, offset=offsets)
+    
     return mx.fast.rope(x, dims, traditional=traditional, base=theta, scale=1.0, offset=offset)
 
 
@@ -400,15 +408,12 @@ class Attention(nn.Module):
         v = qkv[..., q_size + k_size :]
 
         if self.use_qk_norm:
-            # Note: fused kernels are available but MLX native ops are often faster
-            # We keep the custom kernels for benchmarking but default to native MLX with workaround
-            q = q.reshape(b, s, self.num_heads, self.head_dim).transpose(0, 2, 1, 3)
-            k = k.reshape(b, s, self.num_kv_heads, self.head_dim).transpose(0, 2, 1, 3)
-            q = self.q_norm(q)
-            k = self.k_norm(k)
-            q = _rope_workaround(q, self.head_dim, self.rope_theta, offset, traditional=self.rope_traditional)
-            k = _rope_workaround(k, self.head_dim, self.rope_theta, offset, traditional=self.rope_traditional)
+            # Fused kernel combines reshape, transpose, RMSNorm and RoPE into a single pass
+            from model import fused_norm_rope
+            q = fused_norm_rope(q, self.q_norm.weight, self.num_heads, self.head_dim, offset, self.rope_theta)
+            k = fused_norm_rope(k, self.k_norm.weight, self.num_kv_heads, self.head_dim, offset, self.rope_theta)
         else:
+            # Unfused fallback if QK norm is disabled
             q = q.reshape(b, s, self.num_heads, self.head_dim).transpose(0, 2, 1, 3)
             k = k.reshape(b, s, self.num_kv_heads, self.head_dim).transpose(0, 2, 1, 3)
             q = _rope_workaround(q, self.head_dim, self.rope_theta, offset, traditional=self.rope_traditional)
