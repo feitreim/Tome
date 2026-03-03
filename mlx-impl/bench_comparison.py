@@ -329,8 +329,11 @@ def main():
     suites = sys.argv[1:] if len(sys.argv) > 1 else ["all"]
     run_all = "all" in suites
 
-    if "correctness" in suites:
+    if run_all or "correctness" in suites:
         test_correctness()
+
+    # If only correctness was requested (without 'all' or other benchmark suites), return
+    if not run_all and len(suites) == 1 and "correctness" in suites:
         return
 
     batch_sizes = BATCH_SIZES
