@@ -5,7 +5,6 @@ import sys
 import time
 
 import mlx.core as mx
-import numpy as np
 
 MODEL_NAME = "Qwen/Qwen3-0.6B"
 VOCAB_SIZE = 151936
@@ -29,7 +28,6 @@ BATCH_SIZES = [1, 8, 16, 32, 64, 128]
 
 
 def _build_tome_model():
-    from kvcache import BlockAllocator, KVCache
     from load_weights import download_qwen3, load_qwen3_weights
     from model import Qwen3
 
@@ -197,7 +195,7 @@ def vllm_generate(prompt: str, gen_tokens: int) -> list[int]:
 
 def bench_mlx_lm() -> float:
     """mlx-lm only supports batch_size=1, so just return single-sequence tok/s."""
-    from mlx_lm import load, generate
+    from mlx_lm import generate, load
 
     model, tokenizer = load(MODEL_NAME)
 
@@ -220,8 +218,9 @@ def bench_mlx_lm() -> float:
 
 def test_correctness():
     """Compare greedy generation between Tome, vllm-mlx, and mlx-lm."""
+    from mlx_lm import generate as mlx_generate
+    from mlx_lm import load
     from transformers import AutoTokenizer
-    from mlx_lm import load, generate as mlx_generate
 
     tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME)
     prompt_ids = tokenizer.encode(PROMPT, add_special_tokens=False)
@@ -235,21 +234,21 @@ def test_correctness():
     gen_tokens = 30
 
     print("Correctness test: Tome vs mlx-lm vs vllm-mlx (greedy, 30 tokens)")
-    print(f"  Prompt: {repr(PROMPT)} ({len(prompt_ids)} tokens)")
+    print(f"  Prompt: {PROMPT!r} ({len(prompt_ids)} tokens)")
 
     # mlx-lm
     print("  Running mlx-lm...", flush=True)
     model_mlx, tokenizer_mlx = load(MODEL_NAME)
     # Generate with mlx-lm
     mlx_lm_text = mlx_generate(model_mlx, tokenizer_mlx, prompt=PROMPT, max_tokens=gen_tokens, verbose=False)
-    # Re-encode to get actual tokens for comparison. 
+    # Re-encode to get actual tokens for comparison.
     # NOTE: We prepend a space to avoid the "no-space-at-start" encoding bug if text starts with word
     # Actually, the most robust way is to encode the full text (prompt + completion) and take the completion part.
     full_text = PROMPT + mlx_lm_text
     full_tokens = tokenizer_mlx.encode(full_text)
     prompt_len_tokens = len(tokenizer_mlx.encode(PROMPT))
     mlx_lm_tokens = full_tokens[prompt_len_tokens:]
-    
+
     del model_mlx
     mx.clear_cache()
 
@@ -269,16 +268,16 @@ def test_correctness():
     tome_text = tokenizer.decode(tome_tokens, skip_special_tokens=True)
     vllm_text = tokenizer.decode(vllm_tokens, skip_special_tokens=True)
 
-    print(f"\n  mlx-lm: {repr(mlx_lm_text[:120])}")
-    print(f"  Tome  : {repr(tome_text[:120])}")
-    print(f"  vllm  : {repr(vllm_text[:120])}")
+    print(f"\n  mlx-lm: {mlx_lm_text[:120]!r}")
+    print(f"  Tome  : {tome_text[:120]!r}")
+    print(f"  vllm  : {vllm_text[:120]!r}")
 
     # String-level comparison
     def compare_strings(name, actual, expected):
         # Normalize by removing leading spaces for comparison if one has it and other doesn't
         a = actual.strip()
         e = expected.strip()
-        
+
         min_len = min(len(a), len(e))
         match_count = 0
         for i in range(min_len):
@@ -286,11 +285,11 @@ def test_correctness():
                 match_count += 1
             else:
                 break
-        
+
         print(f"  {name} matches mlx-lm for first {match_count} characters")
         if match_count < 10 and len(e) > 0:
-            print(f"    Expected start: {repr(e[:30])}")
-            print(f"    Actual start:   {repr(a[:30])}")
+            print(f"    Expected start: {e[:30]!r}")
+            print(f"    Actual start:   {a[:30]!r}")
 
     compare_strings("Tome", tome_text, mlx_lm_text)
     compare_strings("vllm", vllm_text, mlx_lm_text)
