@@ -157,6 +157,12 @@ class InferenceNodeServicer(inference_pb2_grpc.InferenceNodeServicer):
                         W[q_size + k_size:, :] + delta_W
                     ], axis=0)
                     target_layer.self_attn.qkv_proj.weight = new_W
+                elif param_name == "self_attn.qkv_proj":
+                    target_layer.self_attn.qkv_proj.weight += delta_W
+                elif param_name == "mlp.gate_up_proj":
+                    target_layer.mlp.gate_up_proj.weight += delta_W
+                elif param_name == "mlp.down_proj":
+                    target_layer.mlp.down_proj.weight += delta_W
                 
             self.policy_version += 1
             # Invalidate policy prefix cache because weights changed

@@ -283,11 +283,19 @@ def fused_rope(
 
 
 def _rope_workaround(x, dims, theta, offset, traditional=False):
-    # mx.fast.rope is buggy for S=1 with B>1: batch item b gets position offset+b instead of offset
-    # Workaround: pass offset as a tensor of shape (B,) with identical values
+    # mx.fast.rope is buggy for S=1 with B>1 when offset is a scalar.
+    # If offset is an array of shape (B,), it works correctly.
+    if isinstance(offset, mx.array) and offset.ndim > 0:
+        return mx.fast.rope(x, dims, traditional=traditional, base=theta, scale=1.0, offset=offset)
+    
+    # Fallback/Workaround for scalar offset
     if x.shape[2] == 1 and x.shape[0] > 1:
-        offsets = mx.full((x.shape[0],), offset, dtype=mx.int32)
+        if isinstance(offset, mx.array):
+            offsets = mx.full((x.shape[0],), offset, dtype=mx.int32)
+        else:
+            offsets = mx.array([offset] * x.shape[0], dtype=mx.int32)
         return mx.fast.rope(x, dims, traditional=traditional, base=theta, scale=1.0, offset=offsets)
+    
     return mx.fast.rope(x, dims, traditional=traditional, base=theta, scale=1.0, offset=offset)
 
 
