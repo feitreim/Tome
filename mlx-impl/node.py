@@ -174,54 +174,125 @@ class InferenceNodeServicer(inference_pb2_grpc.InferenceNodeServicer):
             logger.error(f"Weight update error: {e}")
             return inference_pb2.WeightUpdateResponse(success=False)
 
-    async def GRPO(  # noqa: N802
+    async def Rollout(  # noqa: N802
         self,
-        request: inference_pb2.GRPORequest,
+        request: inference_pb2.RolloutRequest,
         context: grpc.aio.ServicerContext,
-    ) -> inference_pb2.GRPOResponse:
-        """Process GRPO request: rollouts + scoring."""
-        logger.info(f"GRPO request {request.batch_id}: {len(request.prompts)} prompts, G={request.group_size}")
+    ) -> inference_pb2.RolloutResponse:
+        """Process GRPO rollout request: generate rollouts + reference log-probs."""
+        logger.info(f"Rollout request {request.batch_id}: {len(request.prompts)} prompts, G={request.group_size}")
         
         batch_id = request.batch_id
         G = request.group_size
-        max_concurrent_prompts = request.max_concurrent or 4
         all_results = []
         
-        # 1. Shared rubric prefill
-        rubric_tokens = list(request.judge.rubric_tokens)
-        # We don't prefill rubric here if we are just doing rollouts, 
-        # but the plan says Phase 1 is Rollout Generation.
-        # Rubric is for Phase 2: Judge Scoring.
-        
-        # Process prompts in chunks
+        # Process prompts in chunks to manage memory
+        max_concurrent_prompts = 4 # Conservative default
         for i in range(0, len(request.prompts), max_concurrent_prompts):
             chunk_prompts = request.prompts[i : i + max_concurrent_prompts]
-            logger.info(f"Processing GRPO rollout chunk: prompts {i} to {i + len(chunk_prompts)}")
+            logger.info(f"Processing rollout chunk: prompts {i} to {i + len(chunk_prompts)}")
             
-            chunk_results = await self._process_grpo_rollout_chunk(
+            chunk_results = await self._process_rollout_chunk(
                 chunk_prompts, G, request.temperature, request.max_tokens
             )
             
-            # Phase 2: Judge Scoring for this chunk
-            logger.info(f"Processing GRPO judge chunk: prompts {i} to {i + len(chunk_prompts)}")
-            await self._process_grpo_judge_chunk(
-                chunk_prompts, chunk_results, request.judge
-            )
-            
-            # Phase 3: Reference Model log-probs
-            logger.info(f"Processing GRPO ref log-probs chunk: prompts {i} to {i + len(chunk_prompts)}")
-            await self._process_grpo_ref_logprobs_chunk(
-                chunk_prompts, chunk_results
-            )
+            # Phase 2: Reference Model log-probs
+            logger.info(f"Processing ref log-probs chunk: prompts {i} to {i + len(chunk_prompts)}")
+            await self._process_ref_logprobs(chunk_prompts, chunk_results)
             
             all_results.extend(chunk_results)
             
-        return inference_pb2.GRPOResponse(batch_id=batch_id, results=all_results)
+        return inference_pb2.RolloutResponse(batch_id=batch_id, results=all_results)
 
-    async def _process_grpo_ref_logprobs_chunk(
+    async def Judge(  # noqa: N802
+        self,
+        request: inference_pb2.JudgeRequest,
+        context: grpc.aio.ServicerContext,
+    ) -> inference_pb2.JudgeResponse:
+        """Process GRPO judge request: evaluate completions using shared rubric."""
+        logger.info(f"Judge request {request.batch_id}: {len(request.items)} items")
+        
+        batch_id = request.batch_id
+        rubric_tokens = list(request.rubric_tokens)
+        
+        # 1. Prefill rubric (shared prefix)
+        if rubric_tokens:
+            matched_len, matched_blocks = self.prefix_cache.lookup(rubric_tokens)
+            rubric_cache = self._create_cache(batch_size=1)
+            if matched_len > 0:
+                rubric_cache.offsets = mx.array([matched_len], dtype=mx.int32)
+                rubric_cache.block_tables[0] = matched_blocks
+            
+            rubric_suffix = mx.array(rubric_tokens[matched_len:], dtype=mx.uint32).reshape(1, -1)
+            _, rubric_cache = self.model(rubric_suffix, cache=rubric_cache)
+            mx.eval(rubric_cache.offsets)
+            rubric_cache.advance(len(rubric_tokens) - matched_len)
+            self.prefix_cache.insert(rubric_tokens, rubric_cache.block_tables[0])
+        
+        results = []
+        # Process judge items
+        # Rely on prefix caching for efficiency across items sharing prompts
+        for item in request.items:
+            full_prefix = rubric_tokens + list(item.prompt_tokens)
+            matched_len, matched_blocks = self.prefix_cache.lookup(full_prefix)
+            
+            cache = self._create_cache(batch_size=1)
+            if matched_len > 0:
+                cache.offsets = mx.array([matched_len], dtype=mx.int32)
+                cache.block_tables[0] = matched_blocks
+            
+            suffix = mx.array(full_prefix[matched_len:], dtype=mx.uint32).reshape(1, -1)
+            logits, cache = self.model(suffix, cache=cache)
+            mx.eval(logits)
+            cache.advance(len(full_prefix) - matched_len)
+            self.prefix_cache.insert(full_prefix, cache.block_tables[0])
+            
+            # Decode verdict tokens
+            verdict_tokens = []
+            verdict_log_probs = []
+            
+            from model import fused_log_softmax
+            
+            # Sample first token
+            if request.temperature > 0:
+                token = self._sample_token(logits[0, -1], request.temperature)
+            else:
+                token = int(mx.argmax(logits[0, -1]))
+            
+            log_probs = fused_log_softmax(logits[0, -1:], request.temperature or 1.0)[0]
+            verdict_tokens.append(token)
+            verdict_log_probs.append(float(log_probs[token]))
+            
+            for _ in range(request.max_tokens - 1):
+                if token == self.eos_token_id:
+                    break
+                
+                input_token = mx.array([[token]], dtype=mx.uint32)
+                logits, cache = self.model(input_token, cache=cache)
+                mx.eval(logits)
+                cache.advance(1)
+                
+                log_probs = fused_log_softmax(logits[0, 0], request.temperature or 1.0)
+                if request.temperature > 0:
+                    token = self._sample_token(logits[0, 0], request.temperature)
+                else:
+                    token = int(mx.argmax(logits[0, 0]))
+                
+                verdict_tokens.append(token)
+                verdict_log_probs.append(float(log_probs[token]))
+            
+            results.append(inference_pb2.JudgeResult(
+                item_id=item.item_id,
+                verdict_tokens=verdict_tokens,
+                log_probs=verdict_log_probs
+            ))
+            
+        return inference_pb2.JudgeResponse(batch_id=batch_id, results=results)
+
+    async def _process_ref_logprobs(
         self,
         prompts: list[inference_pb2.Prompt],
-        results: list[inference_pb2.PromptResult],
+        results: list[inference_pb2.PromptRollout],
     ) -> None:
         """Compute reference model log-probs for the generated completions."""
         from model import fused_log_softmax
@@ -244,11 +315,7 @@ class InferenceNodeServicer(inference_pb2_grpc.InferenceNodeServicer):
             self.reference_prefix_cache.insert(tokens_list, cache.block_tables[0])
             
             # Now compute log-probs for each completion
-            # Completion tokens include the tokens generated by the policy model
             for completion in p_res.completions:
-                # We need to teacher-force the completion tokens through the reference model
-                # Wait, we want log P(completion_token_i | prompt + completion_tokens[:i])
-                
                 # Full sequence for this completion
                 full_tokens = tokens_list + list(completion.tokens)
                 
@@ -259,112 +326,30 @@ class InferenceNodeServicer(inference_pb2_grpc.InferenceNodeServicer):
                     self.allocator.retain(b)
                 c_cache.offsets = mx.array([cache.offsets[0]], dtype=mx.int32)
                 
-                # The tokens we need log-probs for are completion.tokens
-                # But we also need the last token of the prompt to get the FIRST log-prob
-                
-                # Prefill the completion tokens (excluding the last one since we only need logits up to it)
-                # Wait, if completion has tokens [T1, T2, T3], we need:
-                # P(T1 | Prompt) -> from Prompt logits
-                # P(T2 | Prompt + T1) -> from T1 logits
-                # P(T3 | Prompt + T1 + T2) -> from T2 logits
-                
                 all_ref_log_probs = []
                 
-                # Log-prob for first token (T1) comes from prompt prefill logits
+                # Log-prob for first token comes from prompt prefill logits
                 log_probs_first = fused_log_softmax(logits[0, -1 :], 1.0)[0]
                 all_ref_log_probs.append(float(log_probs_first[completion.tokens[0]]))
                 
                 if len(completion.tokens) > 1:
-                    # Tokens to feed: completion.tokens[:-1]
-                    # Logits will be for completion.tokens[1:]
                     c_tokens_mx = mx.array(completion.tokens[:-1], dtype=mx.uint32).reshape(1, -1)
                     c_logits, _ = self.reference_model(c_tokens_mx, cache=c_cache)
                     mx.eval(c_logits)
                     
-                    # c_logits shape: (1, S_gen-1, V)
-                    # We need log-probs for tokens[1:]
                     for i in range(len(completion.tokens) - 1):
                         step_log_probs = fused_log_softmax(c_logits[0, i : i + 1], 1.0)[0]
                         all_ref_log_probs.append(float(step_log_probs[completion.tokens[i + 1]]))
                 
                 completion.ref_log_probs.extend(all_ref_log_probs)
 
-    async def _process_grpo_judge_chunk(
-        self,
-        prompts: list[inference_pb2.Prompt],
-        results: list[inference_pb2.PromptResult],
-        judge_config: inference_pb2.JudgeConfig,
-    ) -> None:
-        """Score rollouts for a chunk of prompts using the reference model."""
-        # Note: The plan says "Judge Scoring... prefill rubric once... prefill prompt once...".
-        # We use the reference_model for judging? Actually, the plan doesn't specify which model.
-        # Usually the judge is a DIFFERENT model, but Tome uses dual models.
-        # The plan says "Phase 2: Judge calls... prefill rubric... decode all 64 to get judge verdicts".
-        # I'll use the policy model for judging for now, or the reference model if preferred.
-        # Given Tome's design, the judge might be the same model.
-        
-        num_prompts = len(prompts)
-        rubric_tokens = list(judge_config.rubric_tokens)
-        
-        # 1. Prefill rubric (shared across ALL judge calls)
-        matched_len, matched_blocks = self.prefix_cache.lookup(rubric_tokens)
-        rubric_cache = self._create_cache(batch_size=1)
-        if matched_len > 0:
-            rubric_cache.offsets = mx.array([matched_len], dtype=mx.int32)
-            rubric_cache.block_tables[0] = matched_blocks
-        
-        rubric_suffix = mx.array(rubric_tokens[matched_len:], dtype=mx.uint32).reshape(1, -1)
-        _, rubric_cache = self.model(rubric_suffix, cache=rubric_cache)
-        mx.eval(rubric_cache.offsets)
-        rubric_cache.advance(len(rubric_tokens) - matched_len)
-        self.prefix_cache.insert(rubric_tokens, rubric_cache.block_tables[0])
-        
-        # 2. For each prompt, prefill rubric + prompt
-        for p_idx, (p, p_res) in enumerate(zip(prompts, results)):
-            full_prefix = rubric_tokens + list(p.tokens)
-            matched_len, matched_blocks = self.prefix_cache.lookup(full_prefix)
-            
-            p_judge_cache = self._create_cache(batch_size=1)
-            if matched_len > 0:
-                p_judge_cache.offsets = mx.array([matched_len], dtype=mx.int32)
-                p_judge_cache.block_tables[0] = matched_blocks
-            
-            p_suffix = mx.array(full_prefix[matched_len:], dtype=mx.uint32).reshape(1, -1)
-            _, p_judge_cache = self.model(p_suffix, cache=p_judge_cache)
-            mx.eval(p_judge_cache.offsets)
-            p_judge_cache.advance(len(full_prefix) - matched_len)
-            self.prefix_cache.insert(full_prefix, p_judge_cache.block_tables[0])
-            
-            # 3. For each completion, prefill rubric + prompt + completion and decode verdict
-            # To keep it efficient, we could batch completions, but for now one by one
-            for c_idx, completion in enumerate(p_res.completions):
-                full_judge_tokens = full_prefix + list(completion.tokens)
-                matched_len, matched_blocks = self.prefix_cache.lookup(full_judge_tokens)
-                
-                c_judge_cache = self._create_cache(batch_size=1)
-                if matched_len > 0:
-                    c_judge_cache.offsets = mx.array([matched_len], dtype=mx.int32)
-                    c_judge_cache.block_tables[0] = matched_blocks
-                
-                c_suffix = mx.array(full_judge_tokens[matched_len:], dtype=mx.uint32).reshape(1, -1)
-                logits, c_judge_cache = self.model(c_suffix, cache=c_judge_cache)
-                mx.eval(logits)
-                c_judge_cache.advance(len(full_judge_tokens) - matched_len)
-                
-                # Decode verdict (e.g. 1 token)
-                # In a real GRPO, the judge would output a score or a structured verdict.
-                # For now, we'll just sample 1 token and parse it as a score.
-                next_token = int(mx.argmax(logits[0, -1]))
-                # Dummy scoring: Use token value mod 10 as score
-                completion.judge_score = float(next_token % 10)
-
-    async def _process_grpo_rollout_chunk(
+    async def _process_rollout_chunk(
         self,
         prompts: list[inference_pb2.Prompt],
         G: int,
         temperature: float,
         max_tokens: int,
-    ) -> list[inference_pb2.PromptResult]:
+    ) -> list[inference_pb2.PromptRollout]:
         """Generate rollouts for a chunk of prompts."""
         num_prompts = len(prompts)
         total_sequences = num_prompts * G
@@ -394,7 +379,7 @@ class InferenceNodeServicer(inference_pb2_grpc.InferenceNodeServicer):
         
         for p_idx, (last_logits, p_blocks, p_offset, p_tokens) in enumerate(prompt_data):
             # Compute log_probs for all vocab at once for this prompt's end
-            log_probs_all = fused_log_softmax(last_logits[None], temperature)[0]
+            log_probs_all = fused_log_softmax(last_logits[None], temperature or 1.0)[0]
             
             for g_idx in range(G):
                 seq_idx = p_idx * G + g_idx
@@ -430,7 +415,7 @@ class InferenceNodeServicer(inference_pb2_grpc.InferenceNodeServicer):
             batched_cache.advance(1)
             
             # log_probs for all tokens in batch: (B, V)
-            log_probs_batch = fused_log_softmax(logits[:, 0, :], temperature)
+            log_probs_batch = fused_log_softmax(logits[:, 0, :], temperature or 1.0)
             
             new_active_tokens = []
             for b_idx in range(total_sequences):
@@ -454,7 +439,7 @@ class InferenceNodeServicer(inference_pb2_grpc.InferenceNodeServicer):
             
             active_tokens = new_active_tokens
             if step % 10 == 0:
-                logger.info(f"GRPO rollout step {step}: {sum(is_finished)}/{total_sequences} finished")
+                logger.info(f"Rollout step {step}: {sum(is_finished)}/{total_sequences} finished")
 
         # 4. Format results
         final_prompt_results = []
@@ -463,16 +448,17 @@ class InferenceNodeServicer(inference_pb2_grpc.InferenceNodeServicer):
             for g_idx in range(G):
                 seq_idx = p_idx * G + g_idx
                 res = seq_results[seq_idx]
-                completions.append(inference_pb2.CompletionResult(
+                completions.append(inference_pb2.Completion(
                     tokens=res["tokens"],
                     log_probs=res["log_probs"]
                 ))
-            final_prompt_results.append(inference_pb2.PromptResult(
+            final_prompt_results.append(inference_pb2.PromptRollout(
                 prompt_id=prompts[p_idx].prompt_id,
                 completions=completions
             ))
             
         return final_prompt_results
+
 
     def _create_cache(self, batch_size: int = 1) -> KVCache:
         """Create a new KV cache instance."""

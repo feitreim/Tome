@@ -3,9 +3,9 @@ use tonic::transport::Channel;
 use tracing::{info, warn};
 
 use crate::proto::{
-    inference_node_client::InferenceNodeClient, GenerateRequest, GrpoRequest, GrpoResponse,
-    NodeStatus, PrefillRequest, PrefillResponse, StatusRequest, TokenResponse, WeightUpdateRequest,
-    WeightUpdateResponse,
+    inference_node_client::InferenceNodeClient, GenerateRequest, JudgeRequest, JudgeResponse,
+    NodeStatus, PrefillRequest, PrefillResponse, RolloutRequest, RolloutResponse, StatusRequest,
+    TokenResponse, WeightUpdateRequest, WeightUpdateResponse,
 };
 
 /// Cached status from the last health check.
@@ -54,9 +54,15 @@ impl NodeConnection {
         Ok(resp.into_inner())
     }
 
-    pub async fn grpo(&self, req: GrpoRequest) -> Result<GrpoResponse, tonic::Status> {
+    pub async fn rollout(&self, req: RolloutRequest) -> Result<RolloutResponse, tonic::Status> {
         let mut client = self.client.lock().await;
-        let resp = client.grpo(req).await?;
+        let resp = client.rollout(req).await?;
+        Ok(resp.into_inner())
+    }
+
+    pub async fn judge(&self, req: JudgeRequest) -> Result<JudgeResponse, tonic::Status> {
+        let mut client = self.client.lock().await;
+        let resp = client.judge(req).await?;
         Ok(resp.into_inner())
     }
 

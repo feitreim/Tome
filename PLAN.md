@@ -142,41 +142,58 @@ for prompt in prompts:
 ### API
 
 ```protobuf
-message GRPORequest {
+service InferenceNode {
+  // ...
+  rpc Rollout(RolloutRequest) returns (RolloutResponse);
+  rpc Judge(JudgeRequest) returns (JudgeResponse);
+}
+
+message RolloutRequest {
   string batch_id = 1;
   repeated Prompt prompts = 2;
   uint32 group_size = 3;              // G rollouts per prompt
   float temperature = 4;
   uint32 max_tokens = 5;
-  uint32 max_concurrent = 6;          // memory budget: max prompts in flight
-  JudgeConfig judge = 7;
 }
 
-message Prompt {
-  string prompt_id = 1;
-  repeated uint32 tokens = 2;
-}
-
-message JudgeConfig {
-  repeated uint32 rubric_tokens = 1;  // shared rubric prefix
-  float temperature = 2;
-  uint32 max_tokens = 3;
-}
-
-message GRPOResponse {
+message RolloutResponse {
   string batch_id = 1;
-  repeated PromptResult results = 2;
+  repeated PromptRollout results = 2;
 }
 
-message PromptResult {
+message PromptRollout {
   string prompt_id = 1;
-  repeated CompletionResult completions = 2;
+  repeated Completion completions = 2;
 }
 
-message CompletionResult {
+message Completion {
   repeated uint32 tokens = 1;
   repeated float log_probs = 2;
-  float judge_score = 3;
+  repeated float ref_log_probs = 3; // Policy rollouts through frozen model
+}
+
+message JudgeRequest {
+  string batch_id = 1;
+  repeated uint32 rubric_tokens = 2;  // Shared rubric prefix
+  repeated JudgeItem items = 3;
+  float temperature = 4;
+  uint32 max_tokens = 5;
+}
+
+message JudgeItem {
+  string item_id = 1;
+  repeated uint32 prompt_tokens = 2;  // Suffix: Prompt + Completion
+}
+
+message JudgeResponse {
+  string batch_id = 1;
+  repeated JudgeResult results = 2;
+}
+
+message JudgeResult {
+  string item_id = 1;
+  repeated uint32 verdict_tokens = 2;
+  repeated float log_probs = 3;
 }
 ```
 
