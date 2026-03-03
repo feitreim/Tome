@@ -94,82 +94,64 @@ class InferenceNodeServicer(inference_pb2_grpc.InferenceNodeServicer):
         # Metrics
         self.total_cached_tokens = 0
         self.active_count = 0
+        self.num_heads = model.layers[0].self_attn.num_heads
 
     async def UpdateWeights(  # noqa: N802
         self,
         request: inference_pb2.WeightUpdateRequest,
         context: grpc.aio.ServicerContext,
     ) -> inference_pb2.WeightUpdateResponse:
-        """Update policy model weights with LoRA matrices."""
+        """Update policy model weights with LoRA matrices.
+
+        Uses reference_model weights as the frozen base, then sets:
+            policy_W = base_W + lora_scale * (B @ A)
+        This is non-cumulative — each call replaces the previous LoRA effect.
+        """
         logger.info(f"Weight update request: {len(request.updates)} layers")
 
         try:
+            # Group updates by layer to batch qkv slicing
+            layer_deltas: dict[int, dict[str, tuple[mx.array, float]]] = {}
             for update in request.updates:
-                layer_idx = update.layer_idx
-                param_name = update.param_name
-
-                # Convert bytes to MLX arrays
-                # We assume the bytes are bf16 bits, which NumPy can handle as uint16
-                # Then we view as bfloat16 in MLX.
-                # If the buffer is empty, we handle it.
                 if not update.lora_A or not update.lora_B:
-                    logger.warning(f"Empty LoRA update for layer {layer_idx}")
+                    logger.warning(f"Empty LoRA update for layer {update.layer_idx}")
                     continue
 
                 a_np = np.frombuffer(update.lora_A, dtype=np.uint16).reshape(list(update.shape_A))
                 b_np = np.frombuffer(update.lora_B, dtype=np.uint16).reshape(list(update.shape_B))
-
                 lora_A = mx.array(a_np).view(mx.bfloat16)
                 lora_B = mx.array(b_np).view(mx.bfloat16)
+                scale = update.lora_scale if update.lora_scale != 0.0 else 1.0
+                delta_W = scale * (lora_B @ lora_A)
 
-                # Compute delta: B @ A
-                delta_W = lora_B @ lora_A # (out_dim, rank) @ (rank, in_dim) -> (out_dim, in_dim)
+                layer_deltas.setdefault(update.layer_idx, {})[update.param_name] = delta_W
 
-                # Apply to policy model
-                # param_name might be "self_attn.q_proj"
+            for layer_idx, deltas in layer_deltas.items():
+                ref_layer = self.reference_model.layers[layer_idx]
                 target_layer = self.model.layers[layer_idx]
 
-                if param_name == "self_attn.q_proj":
-                    # qkv_proj.weight shape is ( (num_heads + 2*num_kv_heads) * head_dim, dim )
-                    # delta_W shape is ( num_heads * head_dim, dim )
-                    W = target_layer.self_attn.qkv_proj.weight
-                    new_W = mx.concatenate([
-                        W[:delta_W.shape[0], :] + delta_W,
-                        W[delta_W.shape[0]:, :]
-                    ], axis=0)
-                    target_layer.self_attn.qkv_proj.weight = new_W
-                elif param_name == "self_attn.k_proj":
-                    # K part starts after Q
+                if "self_attn.qkv_proj" in deltas:
+                    base_W = ref_layer.self_attn.qkv_proj.weight
+                    target_layer.self_attn.qkv_proj.weight = base_W + deltas["self_attn.qkv_proj"]
+                elif any(k in deltas for k in ("self_attn.q_proj", "self_attn.k_proj", "self_attn.v_proj")):
+                    base_W = ref_layer.self_attn.qkv_proj.weight
                     q_size = self.num_heads * self.head_dim
                     k_size = self.num_kv_heads * self.head_dim
-                    W = target_layer.self_attn.qkv_proj.weight
-                    new_W = mx.concatenate([
-                        W[:q_size, :],
-                        W[q_size : q_size + k_size, :] + delta_W,
-                        W[q_size + k_size:, :]
-                    ], axis=0)
-                    target_layer.self_attn.qkv_proj.weight = new_W
-                elif param_name == "self_attn.v_proj":
-                    # V part is at the end
-                    q_size = self.num_heads * self.head_dim
-                    k_size = self.num_kv_heads * self.head_dim
-                    W = target_layer.self_attn.qkv_proj.weight
-                    new_W = mx.concatenate([
-                        W[:q_size + k_size, :],
-                        W[q_size + k_size:, :] + delta_W
-                    ], axis=0)
-                    target_layer.self_attn.qkv_proj.weight = new_W
-                elif param_name == "self_attn.qkv_proj":
-                    target_layer.self_attn.qkv_proj.weight += delta_W
-                elif param_name == "mlp.gate_up_proj":
-                    target_layer.mlp.gate_up_proj.weight += delta_W
-                elif param_name == "mlp.down_proj":
-                    target_layer.mlp.down_proj.weight += delta_W
+                    q_delta = deltas.get("self_attn.q_proj", mx.zeros_like(base_W[:q_size]))
+                    k_delta = deltas.get("self_attn.k_proj", mx.zeros_like(base_W[q_size:q_size + k_size]))
+                    v_delta = deltas.get("self_attn.v_proj", mx.zeros_like(base_W[q_size + k_size:]))
+                    target_layer.self_attn.qkv_proj.weight = base_W + mx.concatenate([q_delta, k_delta, v_delta], axis=0)
 
+                if "mlp.gate_up_proj" in deltas:
+                    target_layer.mlp.gate_up_proj.weight = ref_layer.mlp.gate_up_proj.weight + deltas["mlp.gate_up_proj"]
+                if "mlp.down_proj" in deltas:
+                    target_layer.mlp.down_proj.weight = ref_layer.mlp.down_proj.weight + deltas["mlp.down_proj"]
+
+            mx.eval(self.model.parameters())
             self.policy_version += 1
-            # Invalidate policy prefix cache because weights changed
             self.prefix_cache = PrefixCache(self.allocator)
 
+            logger.info(f"Weight update applied: policy_version={self.policy_version}")
             return inference_pb2.WeightUpdateResponse(success=True, policy_version=self.policy_version)
 
         except Exception as e:
@@ -182,45 +164,48 @@ class InferenceNodeServicer(inference_pb2_grpc.InferenceNodeServicer):
         context: grpc.aio.ServicerContext,
     ) -> inference_pb2.RolloutResponse:
         """Process GRPO rollout request: generate rollouts + reference log-probs."""
-        logger.info(f"Rollout request {request.batch_id}: {len(request.prompts)} prompts, G={request.group_size}")
+        try:
+            logger.info(f"Rollout request {request.batch_id}: {len(request.prompts)} prompts, G={request.group_size}")
 
-        batch_id = request.batch_id
-        G = request.group_size
-        all_results = []
+            batch_id = request.batch_id
+            G = request.group_size
+            all_results = []
 
-        # Process prompts in chunks to manage memory
-        # Automatically scale concurrent prompts based on group size
-        max_concurrent_prompts = max(1, self.max_inflight_rollouts // G)
-        for i in range(0, len(request.prompts), max_concurrent_prompts):
-            chunk_prompts = request.prompts[i : i + max_concurrent_prompts]
-            logger.info(f"Processing rollout chunk: prompts {i} to {i + len(chunk_prompts)} (Batch Size: {len(chunk_prompts) * G})")
+            # Process prompts in chunks to manage memory
+            # Automatically scale concurrent prompts based on group size
+            max_concurrent_prompts = max(1, self.max_inflight_rollouts // G)
+            for i in range(0, len(request.prompts), max_concurrent_prompts):
+                chunk_prompts = request.prompts[i : i + max_concurrent_prompts]
+                logger.info(f"Processing rollout chunk: prompts {i} to {i + len(chunk_prompts)} (Batch Size: {len(chunk_prompts) * G})")
 
-            t0 = time.perf_counter()
-            chunk_results = await self._process_rollout_chunk(
-                chunk_prompts, G, request.temperature, request.max_tokens
-            )
-            t1 = time.perf_counter()
+                t0 = time.perf_counter()
+                chunk_results = await self._process_rollout_chunk(
+                    chunk_prompts, G, request.temperature, request.max_tokens
+                )
+                t1 = time.perf_counter()
 
-            # Calculate tokens generated
-            num_rollout_tokens = sum(len(res.completions[g].tokens) for res in chunk_results for g in range(G))
-            elapsed = t1 - t0
-            tps = num_rollout_tokens / elapsed if elapsed > 0 else 0
-            logger.info(f"Rollout chunk completed: {num_rollout_tokens} tokens in {elapsed:.2f}s ({tps:.1f} tok/s)")
+                # Calculate tokens generated
+                num_rollout_tokens = sum(len(res.completions[g].tokens) for res in chunk_results for g in range(G))
+                elapsed = t1 - t0
+                tps = num_rollout_tokens / elapsed if elapsed > 0 else 0
+                logger.info(f"Rollout chunk completed: {num_rollout_tokens} tokens in {elapsed:.2f}s ({tps:.1f} tok/s)")
 
-            # Phase 2: Reference Model log-probs (Batched)
-            logger.info(f"Processing ref log-probs chunk: prompts {i} to {i + len(chunk_prompts)}")
-            t0_ref = time.perf_counter()
-            await self._process_ref_logprobs_batched(chunk_prompts, chunk_results, G)
-            t1_ref = time.perf_counter()
+                # Phase 2: Reference Model log-probs (Batched)
+                logger.info(f"Processing ref log-probs chunk: prompts {i} to {i + len(chunk_prompts)}")
+                t0_ref = time.perf_counter()
+                await self._process_ref_logprobs_batched(chunk_prompts, chunk_results, G, request.temperature)
+                t1_ref = time.perf_counter()
+                num_ref_tokens = sum(len(res.completions[g].tokens) for res in chunk_results for g in range(G))
+                elapsed_ref = t1_ref - t0_ref
+                tps_ref = num_ref_tokens / elapsed_ref if elapsed_ref > 0 else 0
+                logger.info(f"Ref log-probs chunk completed: {num_ref_tokens} tokens in {elapsed_ref:.2f}s ({tps_ref:.1f} tok/s)")
 
-            num_ref_tokens = sum(len(res.completions[g].tokens) for res in chunk_results for g in range(G))
-            elapsed_ref = t1_ref - t0_ref
-            tps_ref = num_ref_tokens / elapsed_ref if elapsed_ref > 0 else 0
-            logger.info(f"Ref log-probs chunk completed: {num_ref_tokens} tokens in {elapsed_ref:.2f}s ({tps_ref:.1f} tok/s)")
+                all_results.extend(chunk_results)
 
-            all_results.extend(chunk_results)
-
-        return inference_pb2.RolloutResponse(batch_id=batch_id, results=all_results)
+            return inference_pb2.RolloutResponse(batch_id=batch_id, results=all_results)
+        except Exception as e:
+            logger.exception(f"Rollout error: {e}")
+            await context.abort(grpc.StatusCode.INTERNAL, str(e))
 
     async def Judge(  # noqa: N802
         self,
@@ -236,10 +221,15 @@ class InferenceNodeServicer(inference_pb2_grpc.InferenceNodeServicer):
         # 1. Prefill rubric (shared prefix)
         if rubric_tokens:
             matched_len, matched_blocks = self.prefix_cache.lookup(rubric_tokens)
+            if matched_len == len(rubric_tokens) and len(rubric_tokens) > 0:
+                matched_len -= 1
+
             rubric_cache = self._create_cache(batch_size=1)
             if matched_len > 0:
                 rubric_cache.offsets = mx.array([matched_len], dtype=mx.int32)
-                rubric_cache.block_tables[0] = matched_blocks
+                rubric_cache.block_tables[0] = list(matched_blocks)
+                for b in matched_blocks:
+                    self.allocator.retain(b)
 
             rubric_suffix = mx.array(rubric_tokens[matched_len:], dtype=mx.uint32).reshape(1, -1)
             _, rubric_cache = self.model(rubric_suffix, cache=rubric_cache)
@@ -256,11 +246,15 @@ class InferenceNodeServicer(inference_pb2_grpc.InferenceNodeServicer):
         for item in request.items:
             full_prefix = rubric_tokens + list(item.prompt_tokens)
             matched_len, matched_blocks = self.prefix_cache.lookup(full_prefix)
+            if matched_len == len(full_prefix) and len(full_prefix) > 0:
+                matched_len -= 1
 
             cache = self._create_cache(batch_size=1)
             if matched_len > 0:
                 cache.offsets = mx.array([matched_len], dtype=mx.int32)
-                cache.block_tables[0] = matched_blocks
+                cache.block_tables[0] = list(matched_blocks)
+                for b in matched_blocks:
+                    self.allocator.retain(b)
 
             suffix = mx.array(full_prefix[matched_len:], dtype=mx.uint32).reshape(1, -1)
             logits, cache = self.model(suffix, cache=cache)
@@ -320,36 +314,48 @@ class InferenceNodeServicer(inference_pb2_grpc.InferenceNodeServicer):
         prompts: list[inference_pb2.Prompt],
         results: list[inference_pb2.PromptRollout],
         G: int,
+        temperature: float = 1.0,
     ) -> None:
         """Compute reference model log-probs for completions using batching."""
         from model import fused_log_softmax
 
         for p_idx, (p, p_res) in enumerate(zip(prompts, results)):
             tokens_list = list(p.tokens)
-            matched_len, matched_blocks = self.reference_prefix_cache.lookup(tokens_list)
+            # Prefix cache disabled for debugging
+            matched_len, matched_blocks = 0, []
 
             # 1. Prefill prompt once
             cache = self._create_cache(batch_size=1)
             if matched_len > 0:
                 cache.offsets = mx.array([matched_len], dtype=mx.int32)
-                cache.block_tables[0] = matched_blocks
+                cache.block_tables[0] = list(matched_blocks)
+                for b in matched_blocks:
+                    self.allocator.retain(b)
+                for l in range(cache.num_layers):
+                    k, v = cache.gather_kv(l)
+                    cache._keys[l] = k
+                    cache._values[l] = v
 
             tokens_suffix = mx.array(tokens_list[matched_len:], dtype=mx.uint32).reshape(1, -1)
             logits, cache = self.reference_model(tokens_suffix, cache=cache)
             mx.eval(logits)
             cache.advance(len(tokens_list) - matched_len)
+
+            cache.flush_to_pool()
+            mx.eval(self.allocator.k_pool + self.allocator.v_pool)
             self.reference_prefix_cache.insert(tokens_list, cache.block_tables[0])
 
-            # 2. Setup batched forward pass for completions
+            # 2. Setup batched forward pass — copy prefill KV for all G sequences
             batched_cache = self._create_cache(batch_size=G)
+            for l in range(batched_cache.num_layers):
+                batched_cache._keys[l] = mx.repeat(cache._keys[l], G, axis=0)
+                batched_cache._values[l] = mx.repeat(cache._values[l], G, axis=0)
+            mx.eval(batched_cache._keys + batched_cache._values)
             for g in range(G):
-                batched_cache.block_tables[g] = list(cache.block_tables[0])
-                for b in batched_cache.block_tables[g]:
-                    self.allocator.retain(b)
                 batched_cache.offsets[g] = int(cache.offsets[0])
 
             # Log-prob for first token
-            log_probs_first = fused_log_softmax(logits[0, -1:], 1.0)[0]
+            log_probs_first = fused_log_softmax(logits[0, -1:], temperature or 1.0)[0]
             for g in range(G):
                 first_token = p_res.completions[g].tokens[0]
                 p_res.completions[g].ref_log_probs.append(float(log_probs_first[first_token]))
@@ -371,7 +377,7 @@ class InferenceNodeServicer(inference_pb2_grpc.InferenceNodeServicer):
                 mx.eval(logits_step)
                 batched_cache.advance(1)
 
-                log_probs_step = fused_log_softmax(logits_step[:, 0, :], 1.0)
+                log_probs_step = fused_log_softmax(logits_step[:, 0, :], temperature or 1.0)
                 for g in range(G):
                     if active_mask[g]:
                         next_token = p_res.completions[g].tokens[step + 1]
@@ -390,40 +396,82 @@ class InferenceNodeServicer(inference_pb2_grpc.InferenceNodeServicer):
         from model import fused_log_softmax
 
         # 1. Prefill prompts and collect logits
-        prompt_data = [] # (last_logits, block_table, offset, tokens)
+        prompt_data = []  # (last_logits, cache, tokens)
         for p in prompts:
             tokens_list = list(p.tokens)
-            matched_len, matched_blocks = self.prefix_cache.lookup(tokens_list)
+            logger.info(f"Prompt {p.prompt_id}: {len(tokens_list)} tokens")
+            # Prefix cache disabled for debugging
+            matched_len, matched_blocks = 0, []
+            # matched_len, matched_blocks = self.prefix_cache.lookup(tokens_list)
+            # if matched_len == len(tokens_list) and len(tokens_list) > 0:
+            #     matched_len -= 1
+            logger.info(f"  prefix_cache hit: {matched_len}/{len(tokens_list)} tokens, {len(matched_blocks)} blocks")
+
             cache = self._create_cache(batch_size=1)
             if matched_len > 0:
                 cache.offsets = mx.array([matched_len], dtype=mx.int32)
-                cache.block_tables[0] = matched_blocks
+                cache.block_tables[0] = list(matched_blocks)
+                for b in matched_blocks:
+                    self.allocator.retain(b)
+                # Restore KV data from paged pool into contiguous cache
+                for l in range(cache.num_layers):
+                    k, v = cache.gather_kv(l)
+                    cache._keys[l] = k
+                    cache._values[l] = v
+                logger.info(f"  restored KV from pool: keys[0] shape={cache._keys[0].shape}")
 
             tokens_suffix = mx.array(tokens_list[matched_len:], dtype=mx.uint32).reshape(1, -1)
+            logger.info(f"  running model on suffix of {tokens_suffix.shape[1]} tokens, offset={int(cache.offsets[0])}")
             logits, cache = self.model(tokens_suffix, cache=cache)
             mx.eval(logits)
             cache.advance(len(tokens_list) - matched_len)
+            logger.info(f"  after prefill: keys[0] shape={cache._keys[0].shape}, offset={int(cache.offsets[0])}")
+
+            # Flush KV to paged pool for prefix cache persistence
+            cache.flush_to_pool()
+            mx.eval(self.allocator.k_pool + self.allocator.v_pool)
+            logger.info(f"  flushed to pool: {len(cache.block_tables[0])} blocks")
             self.prefix_cache.insert(tokens_list, cache.block_tables[0])
-            prompt_data.append((logits[0, -1], cache.block_tables[0], int(cache.offsets[0]), tokens_list))
 
-        # 2. Fork G rollouts per prompt
+            prompt_data.append((logits[0, -1], cache, tokens_list))
+
+        # 2. Fork G rollouts per prompt — copy prefill KV into batched decode cache
         batched_cache = self._create_cache(batch_size=total_sequences)
-        active_tokens = [] # (total_sequences,)
-        active_log_probs = [] # (total_sequences,)
+        active_tokens = []
+        active_log_probs = []
 
-        for p_idx, (last_logits, p_blocks, p_offset, p_tokens) in enumerate(prompt_data):
-            # Compute log_probs for all vocab at once for this prompt's end
+        # Build batched KV by repeating each prompt's KV G times, padded to max prompt length
+        max_prompt_len = max(int(p_cache.offsets[0]) for _, p_cache, _ in prompt_data)
+        H = self.num_kv_heads
+        D = self.head_dim
+        NL = batched_cache.num_layers
+        dtype = prompt_data[0][1]._keys[0].dtype
+        kv_parts_k = [[] for _ in range(NL)]
+        kv_parts_v = [[] for _ in range(NL)]
+        for p_idx, (last_logits, p_cache, p_tokens) in enumerate(prompt_data):
+            p_len = p_cache._keys[0].shape[2]
+            pad = max_prompt_len - p_len
+            for l in range(NL):
+                k = p_cache._keys[l]
+                v = p_cache._values[l]
+                if pad > 0:
+                    k = mx.concatenate([k, mx.zeros((1, H, pad, D), dtype=dtype)], axis=2)
+                    v = mx.concatenate([v, mx.zeros((1, H, pad, D), dtype=dtype)], axis=2)
+                kv_parts_k[l].append(mx.repeat(k, G, axis=0))
+                kv_parts_v[l].append(mx.repeat(v, G, axis=0))
+        for l in range(NL):
+            batched_cache._keys[l] = mx.concatenate(kv_parts_k[l], axis=0)
+            batched_cache._values[l] = mx.concatenate(kv_parts_v[l], axis=0)
+        mx.eval(batched_cache._keys + batched_cache._values)
+
+        for p_idx, (last_logits, p_cache, p_tokens) in enumerate(prompt_data):
             log_probs_all = fused_log_softmax(last_logits[None], temperature or 1.0)[0]
+            p_offset = int(p_cache.offsets[0])
 
             for g_idx in range(G):
                 seq_idx = p_idx * G + g_idx
-                # Fork blocks and offset
-                batched_cache.block_tables[seq_idx] = list(p_blocks)
-                for b in p_blocks:
-                    self.allocator.retain(b)
                 batched_cache.offsets[seq_idx] = p_offset
 
-                # Sample first token of rollout
                 if temperature > 0:
                     token = self._sample_token(last_logits, temperature)
                 else:
@@ -518,6 +566,9 @@ class InferenceNodeServicer(inference_pb2_grpc.InferenceNodeServicer):
 
             # Check prefix cache
             matched_len, matched_blocks = self.prefix_cache.lookup(request.tokens)
+            if matched_len == len(request.tokens) and len(request.tokens) > 0:
+                matched_len -= 1
+
             if matched_len > 0:
                 logger.info(f"Prefix cache hit for {request.request_id}: {matched_len} tokens")
 
@@ -528,8 +579,10 @@ class InferenceNodeServicer(inference_pb2_grpc.InferenceNodeServicer):
             # Create new cache for this sequence
             cache = self._create_cache()
             if matched_len > 0:
-                cache.offset = matched_len
-                cache.block_tables[0] = matched_blocks
+                cache.offsets = mx.array([matched_len], dtype=mx.int32)
+                cache.block_tables[0] = list(matched_blocks)
+                for b in matched_blocks:
+                    self.allocator.retain(b)
 
             # Run prefill through model
             t0 = time.perf_counter()
@@ -641,6 +694,9 @@ class InferenceNodeServicer(inference_pb2_grpc.InferenceNodeServicer):
 
             # Check prefix cache
             matched_len, matched_blocks = self.prefix_cache.lookup(request.tokens)
+            if matched_len == len(request.tokens) and len(request.tokens) > 0:
+                matched_len -= 1
+
             if matched_len > 0:
                 logger.info(f"Prefix cache hit for {request.request_id}: {matched_len} tokens")
 
@@ -651,8 +707,10 @@ class InferenceNodeServicer(inference_pb2_grpc.InferenceNodeServicer):
             # Create new cache for this sequence
             cache = self._create_cache()
             if matched_len > 0:
-                cache.offset = matched_len
-                cache.block_tables[0] = matched_blocks
+                cache.offsets = mx.array([matched_len], dtype=mx.int32)
+                cache.block_tables[0] = list(matched_blocks)
+                for b in matched_blocks:
+                    self.allocator.retain(b)
 
             # Run prefill through model
             t0 = time.perf_counter()
@@ -820,7 +878,10 @@ async def serve(
     logger.info("Models loaded successfully")
 
     # Create gRPC server
-    server = grpc.aio.server(futures.ThreadPoolExecutor(max_workers=10))
+    server = grpc.aio.server(
+        futures.ThreadPoolExecutor(max_workers=10),
+        options=[("grpc.max_receive_message_length", 64 * 1024 * 1024)],
+    )
     servicer = InferenceNodeServicer(
         model,
         reference_model,

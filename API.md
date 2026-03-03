@@ -9,6 +9,7 @@ Generates multiple rollouts per prompt and computes both policy and reference mo
 ### `POST /v1/grpo/rollout`
 
 **Request Body:**
+
 ```json
 {
   "batch_id": "string",
@@ -25,6 +26,7 @@ Generates multiple rollouts per prompt and computes both policy and reference mo
 ```
 
 **Response Body:**
+
 ```json
 {
   "batch_id": "string",
@@ -55,6 +57,7 @@ Executes batch judging of rollouts using a shared rubric prefix.
 ### `POST /v1/grpo/judge`
 
 **Request Body:**
+
 ```json
 {
   "batch_id": "string",
@@ -71,6 +74,7 @@ Executes batch judging of rollouts using a shared rubric prefix.
 ```
 
 **Response Body:**
+
 ```json
 {
   "batch_id": "string",
@@ -96,6 +100,7 @@ Applies LoRA weight updates to the policy model in-place.
 ### `POST /v1/weights`
 
 **Request Body:**
+
 ```json
 {
   "updates": [
@@ -112,6 +117,7 @@ Applies LoRA weight updates to the policy model in-place.
 ```
 
 **Response Body:**
+
 ```json
 {
   "node_id": {
@@ -129,7 +135,9 @@ Applies LoRA weight updates to the policy model in-place.
 ## Management API
 
 ### `GET /v1/models`
+
 Returns the currently loaded model ID.
 
 ### `GET /v1/nodes`
+
 Returns a list of active inference nodes and their current status (cached tokens, queue depth, etc).

@@ -72,6 +72,7 @@ message LayerUpdate {
   bytes lora_B = 4;                // (out_dim, rank) as bf16
   repeated uint32 shape_A = 5;
   repeated uint32 shape_B = 6;
+  float lora_scale = 7;            // scale/rank factor (e.g. 20.0/8 = 2.5)
 }
 
 message WeightUpdateResponse {

@@ -1,6 +1,6 @@
 use std::sync::Arc;
 
-use axum::extract::State;
+use axum::extract::{DefaultBodyLimit, State};
 use axum::http::StatusCode;
 use axum::response::sse::{Event, Sse};
 use axum::response::IntoResponse;
@@ -29,7 +29,7 @@ pub fn router(state: AppState) -> Router {
         .route("/v1/chat/completions", post(chat_completions))
         .route("/v1/grpo/rollout", post(grpo_rollout))
         .route("/v1/grpo/judge", post(grpo_judge))
-        .route("/v1/weights", post(update_weights))
+        .route("/v1/weights", post(update_weights).layer(DefaultBodyLimit::max(64 * 1024 * 1024)))
         .route("/v1/models", get(list_models))
         .route("/v1/nodes", get(list_nodes).post(register_node))
         .with_state(state)
@@ -562,6 +562,12 @@ struct LayerUpdateJson {
     lora_b: String, // base64 encoded
     shape_a: Vec<u32>,
     shape_b: Vec<u32>,
+    #[serde(default = "default_lora_scale")]
+    lora_scale: f32,
+}
+
+fn default_lora_scale() -> f32 {
+    1.0
 }
 
 async fn update_weights(
@@ -581,6 +587,7 @@ async fn update_weights(
             lora_b,
             shape_a: u.shape_a,
             shape_b: u.shape_b,
+            lora_scale: u.lora_scale,
         });
     }
 
