@@ -4,14 +4,15 @@ import sys
 import os
 import asyncio
 
-# Ensure we can import from the current directory
-sys.path.append(os.path.dirname(os.path.abspath(__file__)))
+# Ensure we can import from the parent directory (mlx-impl)
+MLX_IMPL_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+sys.path.append(MLX_IMPL_DIR)
 from model import Qwen3
 from load_weights import download_qwen3, load_qwen3_weights
 from node import InferenceNodeServicer
 
 # Import generated gRPC code
-sys.path.insert(0, str(os.path.dirname(os.path.abspath(__file__)) + "/generated"))
+sys.path.insert(0, str(MLX_IMPL_DIR + "/generated"))
 import inference_pb2
 
 def test_grpo_new_api():

@@ -32,6 +32,8 @@ import inference_pb2_grpc
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
+DEFAULT_MAX_INFLIGHT_ROLLOUTS = 64
+
 
 @dataclass
 class ActiveSequence:
@@ -52,16 +54,16 @@ class InferenceNodeServicer(inference_pb2_grpc.InferenceNodeServicer):
         self,
         model: Qwen3,
         reference_model: Qwen3,
-        max_batch_size: int = 32,
-        max_seq_len: int = 262144,
+        max_inflight_rollouts: int = DEFAULT_MAX_INFLIGHT_ROLLOUTS,
+        max_seq_len: int = 2048,
         vocab_size: int = 166144,
         eos_token_id: int = 166101,
-        num_blocks: int = 2048,  # 2k blocks * 128 tokens = 256k tokens
+        num_blocks: int = 1024,  # 1k blocks * 128 tokens = 128k tokens
         block_size: int = 128,
     ):
         self.model = model  # Policy model (active)
         self.reference_model = reference_model  # Reference model (frozen)
-        self.max_batch_size = max_batch_size
+        self.max_inflight_rollouts = max_inflight_rollouts
         self.max_seq_len = max_seq_len
         self.vocab_size = vocab_size
         self.eos_token_id = eos_token_id
@@ -81,7 +83,7 @@ class InferenceNodeServicer(inference_pb2_grpc.InferenceNodeServicer):
             head_dim=self.head_dim,
         )
         self.prefix_cache = PrefixCache(self.allocator)
-        # Separate prefix cache for reference model? 
+        # Separate prefix cache for reference model?
         # Actually reference weights are frozen, so prefix cache is always valid.
         self.reference_prefix_cache = PrefixCache(self.allocator)
 
@@ -100,12 +102,12 @@ class InferenceNodeServicer(inference_pb2_grpc.InferenceNodeServicer):
     ) -> inference_pb2.WeightUpdateResponse:
         """Update policy model weights with LoRA matrices."""
         logger.info(f"Weight update request: {len(request.updates)} layers")
-        
+
         try:
             for update in request.updates:
                 layer_idx = update.layer_idx
                 param_name = update.param_name
-                
+
                 # Convert bytes to MLX arrays
                 # We assume the bytes are bf16 bits, which NumPy can handle as uint16
                 # Then we view as bfloat16 in MLX.
@@ -113,20 +115,20 @@ class InferenceNodeServicer(inference_pb2_grpc.InferenceNodeServicer):
                 if not update.lora_A or not update.lora_B:
                     logger.warning(f"Empty LoRA update for layer {layer_idx}")
                     continue
-                    
+
                 a_np = np.frombuffer(update.lora_A, dtype=np.uint16).reshape(list(update.shape_A))
                 b_np = np.frombuffer(update.lora_B, dtype=np.uint16).reshape(list(update.shape_B))
-                
+
                 lora_A = mx.array(a_np).view(mx.bfloat16)
                 lora_B = mx.array(b_np).view(mx.bfloat16)
-                
+
                 # Compute delta: B @ A
                 delta_W = lora_B @ lora_A # (out_dim, rank) @ (rank, in_dim) -> (out_dim, in_dim)
-                
+
                 # Apply to policy model
                 # param_name might be "self_attn.q_proj"
                 target_layer = self.model.layers[layer_idx]
-                
+
                 if param_name == "self_attn.q_proj":
                     # qkv_proj.weight shape is ( (num_heads + 2*num_kv_heads) * head_dim, dim )
                     # delta_W shape is ( num_heads * head_dim, dim )
@@ -163,13 +165,13 @@ class InferenceNodeServicer(inference_pb2_grpc.InferenceNodeServicer):
                     target_layer.mlp.gate_up_proj.weight += delta_W
                 elif param_name == "mlp.down_proj":
                     target_layer.mlp.down_proj.weight += delta_W
-                
+
             self.policy_version += 1
             # Invalidate policy prefix cache because weights changed
             self.prefix_cache = PrefixCache(self.allocator)
-            
+
             return inference_pb2.WeightUpdateResponse(success=True, policy_version=self.policy_version)
-            
+
         except Exception as e:
             logger.error(f"Weight update error: {e}")
             return inference_pb2.WeightUpdateResponse(success=False)
@@ -181,27 +183,28 @@ class InferenceNodeServicer(inference_pb2_grpc.InferenceNodeServicer):
     ) -> inference_pb2.RolloutResponse:
         """Process GRPO rollout request: generate rollouts + reference log-probs."""
         logger.info(f"Rollout request {request.batch_id}: {len(request.prompts)} prompts, G={request.group_size}")
-        
+
         batch_id = request.batch_id
         G = request.group_size
         all_results = []
-        
+
         # Process prompts in chunks to manage memory
-        max_concurrent_prompts = 4 # Conservative default
+        # Automatically scale concurrent prompts based on group size
+        max_concurrent_prompts = max(1, self.max_inflight_rollouts // G)
         for i in range(0, len(request.prompts), max_concurrent_prompts):
             chunk_prompts = request.prompts[i : i + max_concurrent_prompts]
-            logger.info(f"Processing rollout chunk: prompts {i} to {i + len(chunk_prompts)}")
-            
+            logger.info(f"Processing rollout chunk: prompts {i} to {i + len(chunk_prompts)} (Batch Size: {len(chunk_prompts) * G})")
+
             chunk_results = await self._process_rollout_chunk(
                 chunk_prompts, G, request.temperature, request.max_tokens
             )
-            
-            # Phase 2: Reference Model log-probs
+
+            # Phase 2: Reference Model log-probs (Batched)
             logger.info(f"Processing ref log-probs chunk: prompts {i} to {i + len(chunk_prompts)}")
-            await self._process_ref_logprobs(chunk_prompts, chunk_results)
-            
+            await self._process_ref_logprobs_batched(chunk_prompts, chunk_results, G)
+
             all_results.extend(chunk_results)
-            
+
         return inference_pb2.RolloutResponse(batch_id=batch_id, results=all_results)
 
     async def Judge(  # noqa: N802
@@ -211,10 +214,10 @@ class InferenceNodeServicer(inference_pb2_grpc.InferenceNodeServicer):
     ) -> inference_pb2.JudgeResponse:
         """Process GRPO judge request: evaluate completions using shared rubric."""
         logger.info(f"Judge request {request.batch_id}: {len(request.items)} items")
-        
+
         batch_id = request.batch_id
         rubric_tokens = list(request.rubric_tokens)
-        
+
         # 1. Prefill rubric (shared prefix)
         if rubric_tokens:
             matched_len, matched_blocks = self.prefix_cache.lookup(rubric_tokens)
@@ -222,126 +225,134 @@ class InferenceNodeServicer(inference_pb2_grpc.InferenceNodeServicer):
             if matched_len > 0:
                 rubric_cache.offsets = mx.array([matched_len], dtype=mx.int32)
                 rubric_cache.block_tables[0] = matched_blocks
-            
+
             rubric_suffix = mx.array(rubric_tokens[matched_len:], dtype=mx.uint32).reshape(1, -1)
             _, rubric_cache = self.model(rubric_suffix, cache=rubric_cache)
             mx.eval(rubric_cache.offsets)
             rubric_cache.advance(len(rubric_tokens) - matched_len)
             self.prefix_cache.insert(rubric_tokens, rubric_cache.block_tables[0])
-        
+
         results = []
         # Process judge items
         # Rely on prefix caching for efficiency across items sharing prompts
         for item in request.items:
             full_prefix = rubric_tokens + list(item.prompt_tokens)
             matched_len, matched_blocks = self.prefix_cache.lookup(full_prefix)
-            
+
             cache = self._create_cache(batch_size=1)
             if matched_len > 0:
                 cache.offsets = mx.array([matched_len], dtype=mx.int32)
                 cache.block_tables[0] = matched_blocks
-            
+
             suffix = mx.array(full_prefix[matched_len:], dtype=mx.uint32).reshape(1, -1)
             logits, cache = self.model(suffix, cache=cache)
             mx.eval(logits)
             cache.advance(len(full_prefix) - matched_len)
             self.prefix_cache.insert(full_prefix, cache.block_tables[0])
-            
+
             # Decode verdict tokens
             verdict_tokens = []
             verdict_log_probs = []
-            
+
             from model import fused_log_softmax
-            
+
             # Sample first token
             if request.temperature > 0:
                 token = self._sample_token(logits[0, -1], request.temperature)
             else:
                 token = int(mx.argmax(logits[0, -1]))
-            
+
             log_probs = fused_log_softmax(logits[0, -1:], request.temperature or 1.0)[0]
             verdict_tokens.append(token)
             verdict_log_probs.append(float(log_probs[token]))
-            
+
             for _ in range(request.max_tokens - 1):
                 if token == self.eos_token_id:
                     break
-                
+
                 input_token = mx.array([[token]], dtype=mx.uint32)
                 logits, cache = self.model(input_token, cache=cache)
                 mx.eval(logits)
                 cache.advance(1)
-                
+
                 log_probs = fused_log_softmax(logits[0, 0], request.temperature or 1.0)
                 if request.temperature > 0:
                     token = self._sample_token(logits[0, 0], request.temperature)
                 else:
                     token = int(mx.argmax(logits[0, 0]))
-                
+
                 verdict_tokens.append(token)
                 verdict_log_probs.append(float(log_probs[token]))
-            
+
             results.append(inference_pb2.JudgeResult(
                 item_id=item.item_id,
                 verdict_tokens=verdict_tokens,
                 log_probs=verdict_log_probs
             ))
-            
+
         return inference_pb2.JudgeResponse(batch_id=batch_id, results=results)
 
-    async def _process_ref_logprobs(
+    async def _process_ref_logprobs_batched(
         self,
         prompts: list[inference_pb2.Prompt],
         results: list[inference_pb2.PromptRollout],
+        G: int,
     ) -> None:
-        """Compute reference model log-probs for the generated completions."""
+        """Compute reference model log-probs for completions using batching."""
         from model import fused_log_softmax
-        
+
         for p_idx, (p, p_res) in enumerate(zip(prompts, results)):
-            # Use reference_prefix_cache for prompt prefill
             tokens_list = list(p.tokens)
             matched_len, matched_blocks = self.reference_prefix_cache.lookup(tokens_list)
-            
+
+            # 1. Prefill prompt once
             cache = self._create_cache(batch_size=1)
             if matched_len > 0:
                 cache.offsets = mx.array([matched_len], dtype=mx.int32)
                 cache.block_tables[0] = matched_blocks
-            
+
             tokens_suffix = mx.array(tokens_list[matched_len:], dtype=mx.uint32).reshape(1, -1)
-            # Use reference_model!
             logits, cache = self.reference_model(tokens_suffix, cache=cache)
             mx.eval(logits)
             cache.advance(len(tokens_list) - matched_len)
             self.reference_prefix_cache.insert(tokens_list, cache.block_tables[0])
-            
-            # Now compute log-probs for each completion
-            for completion in p_res.completions:
-                # Full sequence for this completion
-                full_tokens = tokens_list + list(completion.tokens)
-                
-                # Create a copy of the prompt cache for this completion
-                c_cache = self._create_cache(batch_size=1)
-                c_cache.block_tables[0] = list(cache.block_tables[0])
-                for b in c_cache.block_tables[0]:
+
+            # 2. Setup batched forward pass for completions
+            batched_cache = self._create_cache(batch_size=G)
+            for g in range(G):
+                batched_cache.block_tables[g] = list(cache.block_tables[0])
+                for b in batched_cache.block_tables[g]:
                     self.allocator.retain(b)
-                c_cache.offsets = mx.array([cache.offsets[0]], dtype=mx.int32)
-                
-                all_ref_log_probs = []
-                
-                # Log-prob for first token comes from prompt prefill logits
-                log_probs_first = fused_log_softmax(logits[0, -1 :], 1.0)[0]
-                all_ref_log_probs.append(float(log_probs_first[completion.tokens[0]]))
-                
-                if len(completion.tokens) > 1:
-                    c_tokens_mx = mx.array(completion.tokens[:-1], dtype=mx.uint32).reshape(1, -1)
-                    c_logits, _ = self.reference_model(c_tokens_mx, cache=c_cache)
-                    mx.eval(c_logits)
-                    
-                    for i in range(len(completion.tokens) - 1):
-                        step_log_probs = fused_log_softmax(c_logits[0, i : i + 1], 1.0)[0]
-                        all_ref_log_probs.append(float(step_log_probs[completion.tokens[i + 1]]))
-                
-                completion.ref_log_probs.extend(all_ref_log_probs)
+                batched_cache.offsets[g] = int(cache.offsets[0])
+
+            # Log-prob for first token
+            log_probs_first = fused_log_softmax(logits[0, -1:], 1.0)[0]
+            for g in range(G):
+                first_token = p_res.completions[g].tokens[0]
+                p_res.completions[g].ref_log_probs.append(float(log_probs_first[first_token]))
+
+            max_len = max(len(c.tokens) for c in p_res.completions)
+            for step in range(max_len - 1):
+                step_tokens = []
+                active_mask = []
+                for g in range(G):
+                    if step < len(p_res.completions[g].tokens) - 1:
+                        step_tokens.append(p_res.completions[g].tokens[step])
+                        active_mask.append(True)
+                    else:
+                        step_tokens.append(0)
+                        active_mask.append(False)
+
+                step_tokens_mx = mx.array(step_tokens, dtype=mx.uint32).reshape(-1, 1)
+                logits_step, _ = self.reference_model(step_tokens_mx, cache=batched_cache)
+                mx.eval(logits_step)
+                batched_cache.advance(1)
+
+                log_probs_step = fused_log_softmax(logits_step[:, 0, :], 1.0)
+                for g in range(G):
+                    if active_mask[g]:
+                        next_token = p_res.completions[g].tokens[step + 1]
+                        p_res.completions[g].ref_log_probs.append(float(log_probs_step[g, next_token]))
 
     async def _process_rollout_chunk(
         self,
@@ -354,7 +365,7 @@ class InferenceNodeServicer(inference_pb2_grpc.InferenceNodeServicer):
         num_prompts = len(prompts)
         total_sequences = num_prompts * G
         from model import fused_log_softmax
-        
+
         # 1. Prefill prompts and collect logits
         prompt_data = [] # (last_logits, block_table, offset, tokens)
         for p in prompts:
@@ -364,7 +375,7 @@ class InferenceNodeServicer(inference_pb2_grpc.InferenceNodeServicer):
             if matched_len > 0:
                 cache.offsets = mx.array([matched_len], dtype=mx.int32)
                 cache.block_tables[0] = matched_blocks
-            
+
             tokens_suffix = mx.array(tokens_list[matched_len:], dtype=mx.uint32).reshape(1, -1)
             logits, cache = self.model(tokens_suffix, cache=cache)
             mx.eval(logits)
@@ -376,67 +387,67 @@ class InferenceNodeServicer(inference_pb2_grpc.InferenceNodeServicer):
         batched_cache = self._create_cache(batch_size=total_sequences)
         active_tokens = [] # (total_sequences,)
         active_log_probs = [] # (total_sequences,)
-        
+
         for p_idx, (last_logits, p_blocks, p_offset, p_tokens) in enumerate(prompt_data):
             # Compute log_probs for all vocab at once for this prompt's end
             log_probs_all = fused_log_softmax(last_logits[None], temperature or 1.0)[0]
-            
+
             for g_idx in range(G):
                 seq_idx = p_idx * G + g_idx
                 # Fork blocks and offset
                 batched_cache.block_tables[seq_idx] = list(p_blocks)
-                for b in p_blocks: 
+                for b in p_blocks:
                     self.allocator.retain(b)
                 batched_cache.offsets[seq_idx] = p_offset
-                
+
                 # Sample first token of rollout
                 if temperature > 0:
                     token = self._sample_token(last_logits, temperature)
                 else:
                     token = int(mx.argmax(last_logits))
-                
+
                 active_tokens.append(token)
                 active_log_probs.append(float(log_probs_all[token]))
 
         # 3. Decode loop
         seq_results = [{"tokens": [active_tokens[i]], "log_probs": [active_log_probs[i]]} for i in range(total_sequences)]
         is_finished = [False] * total_sequences
-        
+
         for step in range(max_tokens - 1):
-            if all(is_finished): 
+            if all(is_finished):
                 break
-            
+
             current_tokens_mx = mx.array(active_tokens, dtype=mx.uint32).reshape(-1, 1)
-            
+
             logits, batched_cache = self.model(current_tokens_mx, cache=batched_cache)
             mx.eval(logits)
-            
+
             # Update offsets in cache
             batched_cache.advance(1)
-            
+
             # log_probs for all tokens in batch: (B, V)
             log_probs_batch = fused_log_softmax(logits[:, 0, :], temperature or 1.0)
-            
+
             new_active_tokens = []
             for b_idx in range(total_sequences):
                 if is_finished[b_idx]:
                     new_active_tokens.append(self.eos_token_id)
                     continue
-                
+
                 # Sample next token
                 if temperature > 0:
                     token = self._sample_token(logits[b_idx, 0], temperature)
                 else:
                     token = int(mx.argmax(logits[b_idx, 0]))
-                
+
                 seq_results[b_idx]["tokens"].append(token)
                 seq_results[b_idx]["log_probs"].append(float(log_probs_batch[b_idx, token]))
-                
+
                 if token == self.eos_token_id or len(seq_results[b_idx]["tokens"]) >= max_tokens:
                     is_finished[b_idx] = True
-                
+
                 new_active_tokens.append(token)
-            
+
             active_tokens = new_active_tokens
             if step % 10 == 0:
                 logger.info(f"Rollout step {step}: {sum(is_finished)}/{total_sequences} finished")
@@ -456,7 +467,7 @@ class InferenceNodeServicer(inference_pb2_grpc.InferenceNodeServicer):
                 prompt_id=prompts[p_idx].prompt_id,
                 completions=completions
             ))
-            
+
         return final_prompt_results
 
 
@@ -481,7 +492,7 @@ class InferenceNodeServicer(inference_pb2_grpc.InferenceNodeServicer):
 
         try:
             num_tokens = len(request.tokens)
-            
+
             # Check prefix cache
             matched_len, matched_blocks = self.prefix_cache.lookup(request.tokens)
             if matched_len > 0:
@@ -501,14 +512,14 @@ class InferenceNodeServicer(inference_pb2_grpc.InferenceNodeServicer):
             t0 = time.perf_counter()
             logits, cache = self.model(tokens_suffix, cache=cache)
             mx.eval(logits)  # Ensure computation is complete
-            
+
             # The model forward pass already updated the cache with new tokens,
             # but we need to advance the offset for the suffix length.
             # Wait, cache.update already used matched_len as base.
             # The original code called cache.advance(num_tokens).
             # Here, we only need to advance by the suffix length.
             cache.advance(num_tokens - matched_len)
-            
+
             elapsed = time.perf_counter() - t0
             tps = (num_tokens - matched_len) / elapsed if elapsed > 0 else float("inf")
             logger.info(f"Prefill {request.request_id}: {num_tokens - matched_len} new tokens in {elapsed:.3f}s ({tps:.1f} tok/s)")
@@ -568,7 +579,7 @@ class InferenceNodeServicer(inference_pb2_grpc.InferenceNodeServicer):
             logits, cache = self.model(last_token, cache=cache)
             mx.eval(logits)
             cache.advance(1)
-            
+
             elapsed = time.perf_counter() - t0
             tps = 1.0 / elapsed if elapsed > 0 else float("inf")
 
@@ -624,10 +635,10 @@ class InferenceNodeServicer(inference_pb2_grpc.InferenceNodeServicer):
             t0 = time.perf_counter()
             logits, cache = self.model(tokens_suffix, cache=cache)
             mx.eval(logits)
-            
+
             # Update cache offset by suffix length
             cache.advance(num_input_tokens - matched_len)
-            
+
             prefill_elapsed = time.perf_counter() - t0
             prefill_tps = (num_input_tokens - matched_len) / prefill_elapsed if prefill_elapsed > 0 else float("inf")
             logger.info(f"StreamGenerate {request.request_id} prefill: {num_input_tokens - matched_len} new tokens in {prefill_elapsed:.3f}s ({prefill_tps:.1f} tok/s)")
@@ -659,7 +670,7 @@ class InferenceNodeServicer(inference_pb2_grpc.InferenceNodeServicer):
                 logits, cache = self.model(last_token, cache=cache)
                 mx.eval(logits)
                 cache.advance(1)
-                
+
                 step_elapsed = time.perf_counter() - t0
                 step_tps = 1.0 / step_elapsed if step_elapsed > 0 else float("inf")
 
@@ -751,7 +762,7 @@ def _register_with_scheduler(grpc_port: int, scheduler_url: str) -> None:
 async def serve(
     port: int = 50052,
     checkpoint_path: str = "Qwen/Qwen3-0.6B",
-    max_batch_size: int = 32,
+    max_inflight_rollouts: int = DEFAULT_MAX_INFLIGHT_ROLLOUTS,
     scheduler_url: str = "http://localhost:8080",
 ):
     """Start the gRPC inference node server."""
@@ -769,7 +780,7 @@ async def serve(
         "num_kv_heads": 8,
         "head_dim": 128,
         "intermediate_size": 3072,
-        "max_seq_len": 40960,
+        "max_seq_len": 2048,
         "rope_theta": 1000000.0,
         "eps": 1e-6,
         "tie_word_embeddings": True,
@@ -790,7 +801,7 @@ async def serve(
     servicer = InferenceNodeServicer(
         model,
         reference_model,
-        max_batch_size=max_batch_size,
+        max_inflight_rollouts=max_inflight_rollouts,
         max_seq_len=config["max_seq_len"],
         vocab_size=config["vocab_size"],
         eos_token_id=151643, # Qwen3 EOS token
@@ -822,8 +833,8 @@ if __name__ == "__main__":
         default="Qwen/Qwen3-0.6B",
         help="Model checkpoint path",
     )
-    parser.add_argument("--max-batch-size", type=int, default=32, help="Maximum batch size")
+    parser.add_argument("--max-inflight-rollouts", type=int, default=DEFAULT_MAX_INFLIGHT_ROLLOUTS, help="Maximum total rollouts (sequences) active at once")
 
     args = parser.parse_args()
 
-    asyncio.run(serve(port=args.port, checkpoint_path=args.checkpoint, max_batch_size=args.max_batch_size))
+    asyncio.run(serve(port=args.port, checkpoint_path=args.checkpoint, max_inflight_rollouts=args.max_inflight_rollouts))

@@ -4,8 +4,13 @@ from __future__ import annotations
 
 import argparse
 import json
+import sys
+import os
 from pathlib import Path
 from typing import Any
+
+# Ensure we can import from the parent directory (mlx-impl)
+sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import mlx.core as mx
 import numpy as np

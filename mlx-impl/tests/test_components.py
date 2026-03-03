@@ -2,15 +2,21 @@
 
 import json
 from pathlib import Path
+import sys
+import os
 
 import mlx.core as mx
 import numpy as np
+
+# Ensure we can import from the parent directory (mlx-impl)
+MLX_IMPL_DIR = Path(__file__).parent.parent
+sys.path.append(str(MLX_IMPL_DIR))
 
 MODEL_NAME = "Qwen/Qwen3-0.6B"
 SEQ_LEN = 32
 ATOL = 0.1  # bf16 accumulation across multi-layer matmuls
 ATOL_FULL = 2.0  # accumulated error across 28 decoder layers
-TEST_DATA_DIR = Path(__file__).parent / "test_inputs"
+TEST_DATA_DIR = MLX_IMPL_DIR / "test_inputs"
 
 
 def _get_our_model(checkpoint_path: str):

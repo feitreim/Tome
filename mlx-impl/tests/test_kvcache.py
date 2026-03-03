@@ -3,8 +3,8 @@ import numpy as np
 import sys
 import os
 
-# Ensure we can import from the current directory
-sys.path.append(os.path.dirname(os.path.abspath(__file__)))
+# Ensure we can import from the parent directory (mlx-impl)
+sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from kvcache import BlockAllocator, KVCache
 
 def test_kv_cache_batched():

@@ -1,7 +1,9 @@
 import sys
 import time
 import os
-sys.path.append(os.path.join(os.getcwd(), "mlx-impl"))
+
+# Ensure we can import from the parent directory (mlx-impl)
+sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import mlx.core as mx
 from kvcache import BlockAllocator, KVCache

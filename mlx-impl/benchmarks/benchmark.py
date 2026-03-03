@@ -1,6 +1,11 @@
 """Benchmark prefill and decode performance for Qwen3-0.6B on MLX."""
 
 import time
+import sys
+import os
+
+# Ensure we can import from the parent directory (mlx-impl)
+sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import mlx.core as mx
 import numpy as np

@@ -48,14 +48,14 @@ uv run mlx-impl/node.py --checkpoint Qwen/Qwen3-0.6B
 uv run mlx-impl/node.py \
   --port 50052 \
   --checkpoint Qwen/Qwen3-0.6B \
-  --max-batch-size 32
+  --max-inflight-rollouts 32
 ```
 
 ### Command-line Options
 
 - `--port`: gRPC server port (default: 50052)
 - `--checkpoint`: HuggingFace model checkpoint (default: Qwen/Qwen3-0.6B)
-- `--max-batch-size`: Maximum batch size for continuous batching (default: 32)
+- `--max-inflight-rollouts`: Maximum total rollouts (sequences) active at once (default: 32)
 
 ## Testing the Server
 
