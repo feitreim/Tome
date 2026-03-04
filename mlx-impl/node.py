@@ -287,110 +287,117 @@ class InferenceNodeServicer(inference_pb2_grpc.InferenceNodeServicer):
         t_prefill_end = time.perf_counter()
         logger.info(f"Judge prefill for {len(request.items)} items took {t_prefill_end - t_prefill_start:.2f}s")
 
-        # Build batched cache for decoding
-        t_build_cache_start = time.perf_counter()
-        B = len(request.items)
-        batched_cache = self._create_cache(batch_size=B)
-        max_len = max(int(c.offsets[0]) for c in item_caches)
-        
-        H = self.num_kv_heads
-        D = self.head_dim
-        NL = batched_cache.num_layers
-        dtype = item_caches[0]._keys[0].dtype
-        
-        for l in range(NL):
-            k_parts = []
-            v_parts = []
-            for c in item_caches:
-                k = c._keys[l]
-                v = c._values[l]
-                pad = max_len - k.shape[2]
-                if pad > 0:
-                    k = mx.concatenate([k, mx.zeros((1, H, pad, D), dtype=dtype)], axis=2)
-                    v = mx.concatenate([v, mx.zeros((1, H, pad, D), dtype=dtype)], axis=2)
-                k_parts.append(k)
-                v_parts.append(v)
-            batched_cache._keys[l] = mx.concatenate(k_parts, axis=0)
-            batched_cache._values[l] = mx.concatenate(v_parts, axis=0)
-            
-        for b in range(B):
-            batched_cache.offsets[b] = int(item_caches[b].offsets[0])
-            
-        mx.eval(batched_cache._keys + batched_cache._values, batched_cache.offsets)
-        t_build_cache_end = time.perf_counter()
-        logger.info(f"Judge cache build took {t_build_cache_end - t_build_cache_start:.2f}s")
-
+        # 3. Batched Decode for all verdicts (Chunked for memory efficiency)
+        final_judge_results = []
+        num_items = len(request.items)
         from model import fused_log_softmax
-        
-        t_decode_start = time.perf_counter()
-        active_tokens = []
-        active_log_probs = []
-        results = []
-        total_verdict_tokens = 0
-        
-        # Sample first tokens
-        logits_first = mx.stack(item_logits) # Shape: [B, V]
-        log_probs_first = fused_log_softmax(logits_first, request.temperature or 1.0)
-        
-        for i, logits_i in enumerate(item_logits):
-            if request.temperature > 0:
-                token = self._sample_token(logits_i, request.temperature)
-            else:
-                token = int(mx.argmax(logits_i))
+
+        for chunk_start in range(0, num_items, self.max_judge_batch_size):
+            chunk_end = min(chunk_start + self.max_judge_batch_size, num_items)
+            chunk_items = request.items[chunk_start:chunk_end]
+            chunk_item_caches = item_caches[chunk_start:chunk_end]
+            chunk_item_logits = item_logits[chunk_start:chunk_end]
+            B_chunk = len(chunk_items)
+
+            # Build batched cache for decoding this chunk
+            t_build_cache_start = time.perf_counter()
+            batched_cache = self._create_cache(batch_size=B_chunk)
+            max_len = max(int(c.offsets[0]) for c in chunk_item_caches)
+            
+            H = self.num_kv_heads
+            D = self.head_dim
+            NL = batched_cache.num_layers
+            dtype = chunk_item_caches[0]._keys[0].dtype
+            
+            for l in range(NL):
+                k_parts = []
+                v_parts = []
+                for c in chunk_item_caches:
+                    k = c._keys[l]
+                    v = c._values[l]
+                    pad = max_len - k.shape[2]
+                    if pad > 0:
+                        k = mx.concatenate([k, mx.zeros((1, H, pad, D), dtype=dtype)], axis=2)
+                        v = mx.concatenate([v, mx.zeros((1, H, pad, D), dtype=dtype)], axis=2)
+                    k_parts.append(k)
+                    v_parts.append(v)
+                batched_cache._keys[l] = mx.concatenate(k_parts, axis=0)
+                batched_cache._values[l] = mx.concatenate(v_parts, axis=0)
                 
-            active_tokens.append(token)
-            active_log_probs.append([float(log_probs_first[i, token])])
-            results.append([token])
-            total_verdict_tokens += 1
-            
-        active_mask = [True] * B
-        
-        for _ in range(request.max_tokens - 1):
-            if not any(active_mask):
-                break
+            for b in range(B_chunk):
+                batched_cache.offsets[b] = int(chunk_item_caches[b].offsets[0])
                 
-            input_tokens = mx.array([[t if active_mask[i] else 0] for i, t in enumerate(active_tokens)], dtype=mx.uint32)
-            logits_step, _ = self.model(input_tokens, cache=batched_cache)
-            mx.eval(logits_step)
-            batched_cache.advance(1)
+            mx.eval(batched_cache._keys + batched_cache._values, batched_cache.offsets)
+            t_build_cache_end = time.perf_counter()
+            logger.info(f"Judge chunk {chunk_start//self.max_judge_batch_size} cache build took {t_build_cache_end - t_build_cache_start:.2f}s")
+
+            t_decode_start = time.perf_counter()
+            active_tokens = []
+            active_log_probs = [[] for _ in range(B_chunk)]
+            chunk_results = [[] for _ in range(B_chunk)]
             
-            logits_b = logits_step[:, 0, :]
-            log_probs_b = fused_log_softmax(logits_b, request.temperature or 1.0)
+            # Sample first tokens
+            logits_first = mx.stack(chunk_item_logits) # Shape: [B_chunk, V]
+            log_probs_first = fused_log_softmax(logits_first, request.temperature or 1.0)
             
-            for i in range(B):
-                if not active_mask[i]:
-                    continue
-                    
-                logits_i = logits_b[i]
+            for i, logits_i in enumerate(chunk_item_logits):
                 if request.temperature > 0:
                     token = self._sample_token(logits_i, request.temperature)
                 else:
                     token = int(mx.argmax(logits_i))
                     
-                active_tokens[i] = token
-                if token == self.eos_token_id:
-                    active_mask[i] = False
-                else:
-                    results[i].append(token)
-                    active_log_probs[i].append(float(log_probs_b[i, token]))
-                    total_verdict_tokens += 1
+                active_tokens.append(token)
+                active_log_probs[i].append(float(log_probs_first[i, token]))
+                chunk_results[i].append(token)
+                total_verdict_tokens += 1
+                
+            active_mask = [True] * B_chunk
+            
+            for _ in range(request.max_tokens - 1):
+                if not any(active_mask):
+                    break
                     
-        t_decode_end = time.perf_counter()
-        logger.info(f"Judge decode took {t_decode_end - t_decode_start:.2f}s for {total_verdict_tokens} tokens")
+                input_tokens = mx.array([[t if active_mask[i] else 0] for i, t in enumerate(active_tokens)], dtype=mx.uint32)
+                logits_step, _ = self.model(input_tokens, cache=batched_cache)
+                mx.eval(logits_step)
+                batched_cache.advance(1)
+                
+                logits_b = logits_step[:, 0, :]
+                log_probs_b = fused_log_softmax(logits_b, request.temperature or 1.0)
+                
+                for i in range(B_chunk):
+                    if not active_mask[i]:
+                        continue
+                        
+                    logits_i = logits_b[i]
+                    if request.temperature > 0:
+                        token = self._sample_token(logits_i, request.temperature)
+                    else:
+                        token = int(mx.argmax(logits_i))
+                        
+                    active_tokens[i] = token
+                    if token == self.eos_token_id:
+                        active_mask[i] = False
+                    else:
+                        chunk_results[i].append(token)
+                        active_log_probs[i].append(float(log_probs_b[i, token]))
+                        total_verdict_tokens += 1
+                        
+            t_decode_end = time.perf_counter()
+            logger.info(f"Judge chunk {chunk_start//self.max_judge_batch_size} decode took {t_decode_end - t_decode_start:.2f}s")
 
-        judge_results = []
-        for i, item in enumerate(request.items):
-            judge_results.append(inference_pb2.JudgeResult(
-                item_id=item.item_id,
-                verdict_tokens=results[i],
-                log_probs=active_log_probs[i]
-            ))
+            for i, item in enumerate(chunk_items):
+                final_judge_results.append(inference_pb2.JudgeResult(
+                    item_id=item.item_id,
+                    verdict_tokens=chunk_results[i],
+                    log_probs=active_log_probs[i]
+                ))
 
         elapsed_judge = time.perf_counter() - t0_judge
         tps_judge = total_verdict_tokens / elapsed_judge if elapsed_judge > 0 else 0
         logger.info(f"Judge request completed: {num_items} items, {total_verdict_tokens} tokens in {elapsed_judge:.2f}s ({tps_judge:.1f} tok/s)")
 
-        return inference_pb2.JudgeResponse(batch_id=batch_id, results=judge_results)
+        return inference_pb2.JudgeResponse(batch_id=batch_id, results=final_judge_results)
 
     async def _process_ref_logprobs_batched(
         self,
@@ -410,15 +417,26 @@ class InferenceNodeServicer(inference_pb2_grpc.InferenceNodeServicer):
 
         t0 = time.perf_counter()
         
-        # Build batched full sequences: prompt + completion[:-1]
-        all_seqs = []
-        all_targets = []
-        seq_lens = []
-        
+        # Build list of all sequences to process
+        all_work = []
         for p_idx, p in enumerate(prompts):
             p_toks = list(p.tokens)
             for g in range(G):
                 c_toks = list(results[p_idx].completions[g].tokens)
+                all_work.append((p_idx, g, p_toks, c_toks))
+
+        num_toks = 0
+        
+        # Process in chunks of max_ref_batch_size
+        for chunk_start in range(0, len(all_work), self.max_ref_batch_size):
+            chunk_end = min(chunk_start + self.max_ref_batch_size, len(all_work))
+            chunk = all_work[chunk_start:chunk_end]
+            
+            all_seqs = []
+            all_targets = []
+            seq_lens = []
+            
+            for p_idx, g, p_toks, c_toks in chunk:
                 if not c_toks:
                     all_seqs.append(p_toks)
                     all_targets.append([])
@@ -426,46 +444,30 @@ class InferenceNodeServicer(inference_pb2_grpc.InferenceNodeServicer):
                     continue
                     
                 full_seq = p_toks + c_toks[:-1]
-                targets = c_toks
                 all_seqs.append(full_seq)
-                all_targets.append(targets)
+                all_targets.append(c_toks)
                 seq_lens.append(len(full_seq))
                 
-        max_len = max(seq_lens)
-        
-        # Pad sequences
-        padded_seqs = []
-        for seq in all_seqs:
-            pad_len = max_len - len(seq)
-            padded_seqs.append(seq + [0] * pad_len)
+            max_len = max(seq_lens)
+            padded_seqs = [seq + [0] * (max_len - len(seq)) for seq in all_seqs]
+            full_ids = mx.array(padded_seqs, dtype=mx.uint32)
             
-        full_ids = mx.array(padded_seqs, dtype=mx.uint32)
-        
-        # Single forward pass without KV cache
-        logits, _ = self.reference_model(full_ids, cache=None)
-        
-        idx = 0
-        num_toks = 0
-        lazy_lps = []
-        
-        for p_idx, p in enumerate(prompts):
-            p_len = len(list(p.tokens))
-            for g in range(G):
-                c_toks = all_targets[idx]
+            logits, _ = self.reference_model(full_ids, cache=None)
+            
+            lazy_lps = []
+            for i, (p_idx, g, p_toks, c_toks) in enumerate(chunk):
                 if c_toks:
-                    # Logits for the completion are from index p_len - 1 to p_len + len(c_toks) - 2
-                    c_logits = logits[idx, p_len - 1 : p_len - 1 + len(c_toks)]
+                    p_len = len(p_toks)
+                    c_logits = logits[i, p_len - 1 : p_len - 1 + len(c_toks)]
                     c_targets = mx.array(c_toks, dtype=mx.uint32)
                     lps = local_compute_logprobs(c_logits, c_targets, temperature or 1.0)
                     lazy_lps.append((p_idx, g, lps))
                     num_toks += len(c_toks)
-                idx += 1
-                
-        if lazy_lps:
-            mx.eval(*[lp for _, _, lp in lazy_lps])
-            
-        for p_idx, g, lps in lazy_lps:
-            results[p_idx].completions[g].ref_log_probs.extend(lps.tolist())
+                    
+            if lazy_lps:
+                mx.eval(*[lp for _, _, lp in lazy_lps])
+                for p_idx, g, lps in lazy_lps:
+                    results[p_idx].completions[g].ref_log_probs.extend(lps.tolist())
 
 <<<<<<< HEAD
             max_comp_len = max(len(c.tokens) for c in p_res.completions)
