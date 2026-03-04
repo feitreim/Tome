@@ -53,16 +53,20 @@ class InferenceNodeServicer(inference_pb2_grpc.InferenceNodeServicer):
         self,
         model: Qwen3,
         reference_model: Qwen3,
-        max_inflight_rollouts: int = DEFAULT_MAX_INFLIGHT_ROLLOUTS,
+        max_rollout_batch_size: int = 64,
+        max_judge_batch_size: int = 32,
+        max_ref_batch_size: int = 32,
         max_seq_len: int = 2048,
         vocab_size: int = 166144,
         eos_token_id: int = 166101,
-        num_blocks: int = 1024,  # 1k blocks * 128 tokens = 128k tokens
+        num_blocks: int = 512,  # Default to ~7.5GB KV cache for Qwen3-0.6B
         block_size: int = 128,
     ):
         self.model = model  # Policy model (active)
         self.reference_model = reference_model  # Reference model (frozen)
-        self.max_inflight_rollouts = max_inflight_rollouts
+        self.max_rollout_batch_size = max_rollout_batch_size
+        self.max_judge_batch_size = max_judge_batch_size
+        self.max_ref_batch_size = max_ref_batch_size
         self.max_seq_len = max_seq_len
         self.vocab_size = vocab_size
         self.eos_token_id = eos_token_id
@@ -171,8 +175,8 @@ class InferenceNodeServicer(inference_pb2_grpc.InferenceNodeServicer):
             all_results = []
 
             # Process prompts in chunks to manage memory
-            # Automatically scale concurrent prompts based on group size
-            max_concurrent_prompts = max(1, self.max_inflight_rollouts // G)
+            # Automatically scale concurrent prompts based on rollout batch size
+            max_concurrent_prompts = max(1, self.max_rollout_batch_size // G)
             for i in range(0, len(request.prompts), max_concurrent_prompts):
                 chunk_prompts = request.prompts[i : i + max_concurrent_prompts]
                 logger.info(f"Processing rollout chunk: prompts {i} to {i + len(chunk_prompts)} (Batch Size: {len(chunk_prompts) * G})")
@@ -204,7 +208,10 @@ class InferenceNodeServicer(inference_pb2_grpc.InferenceNodeServicer):
             return inference_pb2.RolloutResponse(batch_id=batch_id, results=all_results)
         except Exception as e:
             logger.exception(f"Rollout error: {e}")
-            await context.abort(grpc.StatusCode.INTERNAL, str(e))
+            if context:
+                await context.abort(grpc.StatusCode.INTERNAL, str(e))
+            else:
+                raise e
 
     async def Judge(  # noqa: N802
         self,
@@ -216,8 +223,10 @@ class InferenceNodeServicer(inference_pb2_grpc.InferenceNodeServicer):
 
         batch_id = request.batch_id
         rubric_tokens = list(request.rubric_tokens)
+        from model import fused_log_softmax
 
         # 1. Prefill rubric (shared prefix)
+        rubric_cache = None
         if rubric_tokens:
             matched_len, matched_blocks = self.prefix_cache.lookup(rubric_tokens)
             if matched_len == len(rubric_tokens) and len(rubric_tokens) > 0:
@@ -229,85 +238,174 @@ class InferenceNodeServicer(inference_pb2_grpc.InferenceNodeServicer):
                 rubric_cache.block_tables[0] = list(matched_blocks)
                 for b in matched_blocks:
                     self.allocator.retain(b)
+                for l in range(rubric_cache.num_layers):
+                    k, v = rubric_cache.gather_kv(l)
+                    rubric_cache._keys[l] = k
+                    rubric_cache._values[l] = v
 
             rubric_suffix = mx.array(rubric_tokens[matched_len:], dtype=mx.uint32).reshape(1, -1)
             _, rubric_cache = self.model(rubric_suffix, cache=rubric_cache)
             mx.eval(rubric_cache.offsets)
             rubric_cache.advance(len(rubric_tokens) - matched_len)
+
+            rubric_cache.flush_to_pool()
+            mx.eval(self.allocator.k_pool + self.allocator.v_pool)
             self.prefix_cache.insert(rubric_tokens, rubric_cache.block_tables[0])
 
-        results = []
+        # 2. Batched prefill for all judge item prompts
+        num_items = len(request.items)
+        all_full_prefixes = [rubric_tokens + list(item.prompt_tokens) for item in request.items]
+
+        prompt_data = [] # (last_logit, cache, full_tokens)
+
+        # Parallel prefill in chunks
+        prefill_token_limit = 4096
+        for start_idx in range(0, num_items, 8): # Use small chunk size for stability
+            end_idx = min(start_idx + 8, num_items)
+            chunk_items = all_full_prefixes[start_idx:end_idx]
+            chunk_size = len(chunk_items)
+
+            lookups = [self.prefix_cache.lookup(p) for p in chunk_items]
+            matched_lens = [l[0] for l in lookups]
+            matched_blocks_list = [l[1] for l in lookups]
+
+            chunk_cache = self._create_cache(batch_size=chunk_size)
+            chunk_cache.offsets = mx.array(matched_lens, dtype=mx.int32)
+            for i, blocks in enumerate(matched_blocks_list):
+                chunk_cache.block_tables[i] = list(blocks)
+
+            if max(matched_lens) > 0:
+                for l in range(chunk_cache.num_layers):
+                    k, v = chunk_cache.gather_kv(l)
+                    chunk_cache._keys[l] = k
+                    chunk_cache._values[l] = v
+
+            suffixes = [p[ml:] for p, ml in zip(chunk_items, matched_lens)]
+            max_s_len = max(len(s) for s in suffixes)
+            padded_s = [s + [0] * (max_s_len - len(s)) for s in suffixes]
+            suffix_lens = [len(s) for s in suffixes]
+
+            logits, chunk_cache = self.model(mx.array(padded_s, dtype=mx.uint32), cache=chunk_cache)
+            mx.eval(logits)
+
+            chunk_cache.advance(mx.array(suffix_lens, dtype=mx.int32))
+            chunk_cache.flush_to_pool()
+            mx.eval(self.allocator.k_pool + self.allocator.v_pool)
+
+            for i in range(chunk_size):
+                p_len = int(chunk_cache.offsets[i])
+                last_logit = logits[i, suffix_lens[i] - 1]
+
+                # Persistence
+                self.prefix_cache.insert(chunk_items[i], chunk_cache.block_tables[i])
+
+                # Individual cache for decoding
+                p_cache = self._create_cache(batch_size=1)
+                p_cache.offsets = mx.array([p_len], dtype=mx.int32)
+                p_cache.block_tables[0] = list(chunk_cache.block_tables[i])
+                for l in range(p_cache.num_layers):
+                    p_cache._keys[l] = chunk_cache._keys[l][i:i+1, :, :p_len, :]
+                    p_cache._values[l] = chunk_cache._values[l][i:i+1, :, :p_len, :]
+
+                prompt_data.append((last_logit, p_cache))
+
+        # 3. Batched Decode for all verdicts (Chunked for memory efficiency)
+        final_results = []
         total_verdict_tokens = 0
         t0_judge = time.perf_counter()
 
-        # Process judge items
-        # Rely on prefix caching for efficiency across items sharing prompts
-        for idx, item in enumerate(request.items):
-            logger.debug(f"  Judging item {idx+1}/{len(request.items)}: {item.item_id}")
-            full_prefix = rubric_tokens + list(item.prompt_tokens)
-            matched_len, matched_blocks = self.prefix_cache.lookup(full_prefix)
-            if matched_len == len(full_prefix) and len(full_prefix) > 0:
-                matched_len -= 1
+        for chunk_start in range(0, num_items, self.max_judge_batch_size):
+            chunk_end = min(chunk_start + self.max_judge_batch_size, num_items)
+            chunk_size = chunk_end - chunk_start
+            chunk_prompt_data = prompt_data[chunk_start:chunk_end]
+            chunk_items = request.items[chunk_start:chunk_end]
 
-            cache = self._create_cache(batch_size=1)
-            if matched_len > 0:
-                cache.offsets = mx.array([matched_len], dtype=mx.int32)
-                cache.block_tables[0] = list(matched_blocks)
-                for b in matched_blocks:
-                    self.allocator.retain(b)
+            # Create a single batched cache for this chunk
+            decode_cache = self._create_cache(batch_size=chunk_size)
+            active_tokens = []
+            chunk_results_data = [{"item_id": item.item_id, "tokens": [], "log_probs": []} for item in chunk_items]
+            is_finished = [False] * chunk_size
 
-            suffix = mx.array(full_prefix[matched_len:], dtype=mx.uint32).reshape(1, -1)
-            logits, cache = self.model(suffix, cache=cache)
-            mx.eval(logits)
-            cache.advance(len(full_prefix) - matched_len)
-            self.prefix_cache.insert(full_prefix, cache.block_tables[0])
+            # Fork chunk into decode_cache
+            max_p_len = max(int(d[1].offsets[0]) for d in chunk_prompt_data)
+            for l in range(self.num_layers):
+                k_parts = []
+                v_parts = []
+                for i in range(chunk_size):
+                    p_cache = chunk_prompt_data[i][1]
+                    p_len = int(p_cache.offsets[0])
+                    pad = max_p_len - p_len
+                    k, v = p_cache._keys[l], p_cache._values[l]
+                    if pad > 0:
+                        k = mx.concatenate([k, mx.zeros((1, self.num_kv_heads, pad, self.head_dim), dtype=k.dtype)], axis=2)
+                        v = mx.concatenate([v, mx.zeros((1, self.num_kv_heads, pad, self.head_dim), dtype=v.dtype)], axis=2)
+                    k_parts.append(k)
+                    v_parts.append(v)
+                decode_cache._keys[l] = mx.concatenate(k_parts, axis=0)
+                decode_cache._values[l] = mx.concatenate(v_parts, axis=0)
 
-            # Decode verdict tokens
-            verdict_tokens = []
-            verdict_log_probs = []
+            for i in range(chunk_size):
+                decode_cache.offsets[i] = int(chunk_prompt_data[i][1].offsets[0])
+                last_logit = chunk_prompt_data[i][0]
+                log_probs_first = fused_log_softmax(last_logit[None].astype(mx.float32), request.temperature or 1.0)[0]
 
-            from model import fused_log_softmax
+                if request.temperature > 0:
+                    token = self._sample_token(last_logit, request.temperature)
+                else:
+                    token = int(mx.argmax(last_logit))
 
-            # Sample first token
-            if request.temperature > 0:
-                token = self._sample_token(logits[0, -1], request.temperature)
-            else:
-                token = int(mx.argmax(logits[0, -1]))
-
-            log_probs = fused_log_softmax(logits[0, -1:], request.temperature or 1.0)[0]
-            verdict_tokens.append(token)
-            verdict_log_probs.append(float(log_probs[token]))
-
-            for _ in range(request.max_tokens - 1):
+                active_tokens.append(token)
+                chunk_results_data[i]["tokens"].append(token)
+                chunk_results_data[i]["log_probs"].append(float(log_probs_first[token]))
                 if token == self.eos_token_id:
+                    is_finished[i] = True
+
+            for step in range(request.max_tokens - 1):
+                if all(is_finished):
                     break
 
-                input_token = mx.array([[token]], dtype=mx.uint32)
-                logits, cache = self.model(input_token, cache=cache)
-                mx.eval(logits)
-                cache.advance(1)
+                current_tokens_mx = mx.array(active_tokens, dtype=mx.uint32).reshape(-1, 1)
+                logits_step, decode_cache = self.model(current_tokens_mx, cache=decode_cache)
+                mx.eval(logits_step)
+                decode_cache.advance(1)
 
-                log_probs = fused_log_softmax(logits[0, 0], request.temperature or 1.0)
-                if request.temperature > 0:
-                    token = self._sample_token(logits[0, 0], request.temperature)
-                else:
-                    token = int(mx.argmax(logits[0, 0]))
+                log_probs_batch = fused_log_softmax(logits_step[:, 0, :].astype(mx.float32), request.temperature or 1.0)
 
-                verdict_tokens.append(token)
-                verdict_log_probs.append(float(log_probs[token]))
+                new_active_tokens = []
+                for i in range(chunk_size):
+                    if is_finished[i]:
+                        new_active_tokens.append(self.eos_token_id)
+                        continue
 
-            results.append(inference_pb2.JudgeResult(
-                item_id=item.item_id,
-                verdict_tokens=verdict_tokens,
-                log_probs=verdict_log_probs
-            ))
-            total_verdict_tokens += len(verdict_tokens)
+                    if request.temperature > 0:
+                        token = self._sample_token(logits_step[i, 0], request.temperature)
+                    else:
+                        token = int(mx.argmax(logits_step[i, 0]))
+
+                    chunk_results_data[i]["tokens"].append(token)
+                    chunk_results_data[i]["log_probs"].append(float(log_probs_batch[i, token]))
+
+                    if token == self.eos_token_id or len(chunk_results_data[i]["tokens"]) >= request.max_tokens:
+                        is_finished[i] = True
+
+                    new_active_tokens.append(token)
+                active_tokens = new_active_tokens
+
+            total_verdict_tokens += sum(len(res["tokens"]) for res in chunk_results_data)
+            final_results.extend([
+                inference_pb2.JudgeResult(
+                    item_id=res["item_id"],
+                    verdict_tokens=res["tokens"],
+                    log_probs=res["log_probs"]
+                )
+                for res in chunk_results_data
+            ])
 
         elapsed_judge = time.perf_counter() - t0_judge
         tps_judge = total_verdict_tokens / elapsed_judge if elapsed_judge > 0 else 0
-        logger.info(f"Judge request completed: {len(request.items)} items, {total_verdict_tokens} tokens in {elapsed_judge:.2f}s ({tps_judge:.1f} tok/s)")
+        logger.info(f"Judge request completed: {num_items} items, {total_verdict_tokens} tokens in {elapsed_judge:.2f}s ({tps_judge:.1f} tok/s)")
 
-        return inference_pb2.JudgeResponse(batch_id=batch_id, results=results)
+        return inference_pb2.JudgeResponse(batch_id=batch_id, results=final_results)
 
     async def _process_ref_logprobs_batched(
         self,
@@ -346,43 +444,67 @@ class InferenceNodeServicer(inference_pb2_grpc.InferenceNodeServicer):
             mx.eval(self.allocator.k_pool + self.allocator.v_pool)
             self.reference_prefix_cache.insert(tokens_list, cache.block_tables[0])
 
-            # 2. Setup batched forward pass — copy prefill KV for all G sequences
-            batched_cache = self._create_cache(batch_size=G)
-            for l in range(batched_cache.num_layers):
-                batched_cache._keys[l] = mx.repeat(cache._keys[l], G, axis=0)
-                batched_cache._values[l] = mx.repeat(cache._values[l], G, axis=0)
-            mx.eval(batched_cache._keys + batched_cache._values)
-            for g in range(G):
-                batched_cache.offsets[g] = int(cache.offsets[0])
-
-            # Log-prob for first token
-            log_probs_first = fused_log_softmax(logits[0, -1:], temperature or 1.0)[0]
+            # 2. Batched forward pass for completions
+            # Completion token 0 logprob comes from prompt's last logit
+            log_probs_first = fused_log_softmax(logits[0, -1:].astype(mx.float32), temperature or 1.0)[0]
             for g in range(G):
                 first_token = p_res.completions[g].tokens[0]
                 p_res.completions[g].ref_log_probs.append(float(log_probs_first[first_token]))
 
-            max_len = max(len(c.tokens) for c in p_res.completions)
-            for step in range(max_len - 1):
-                step_tokens = []
-                active_mask = []
-                for g in range(G):
-                    if step < len(p_res.completions[g].tokens) - 1:
-                        step_tokens.append(p_res.completions[g].tokens[step])
-                        active_mask.append(True)
-                    else:
-                        step_tokens.append(0)
-                        active_mask.append(False)
+            max_comp_len = max(len(c.tokens) for c in p_res.completions)
+            if max_comp_len <= 1:
+                continue
 
-                step_tokens_mx = mx.array(step_tokens, dtype=mx.uint32).reshape(-1, 1)
-                logits_step, _ = self.reference_model(step_tokens_mx, cache=batched_cache)
-                mx.eval(logits_step)
-                batched_cache.advance(1)
+            # Compute logprobs for completion tokens 1...L-1
+            # Input is tokens 0...L-2
+            # Chunk rollouts if G > max_ref_batch_size
+            for g_start in range(0, G, self.max_ref_batch_size):
+                g_end = min(g_start + self.max_ref_batch_size, G)
+                curr_G = g_end - g_start
 
-                log_probs_step = fused_log_softmax(logits_step[:, 0, :], temperature or 1.0)
-                for g in range(G):
-                    if active_mask[g]:
-                        next_token = p_res.completions[g].tokens[step + 1]
-                        p_res.completions[g].ref_log_probs.append(float(log_probs_step[g, next_token]))
+                batched_cache = self._create_cache(batch_size=curr_G)
+                for l in range(batched_cache.num_layers):
+                    batched_cache._keys[l] = mx.repeat(cache._keys[l], curr_G, axis=0)
+                    batched_cache._values[l] = mx.repeat(cache._values[l], curr_G, axis=0)
+
+                # Important: set offsets to the end of the prompt for all sequences
+                prompt_len = int(cache.offsets[0])
+                batched_cache.offsets = mx.full((curr_G,), prompt_len, dtype=mx.int32)
+
+                comp_inputs = []
+                chunk_completions = p_res.completions[g_start:g_end]
+                max_comp_len_chunk = max(len(c.tokens) for c in chunk_completions)
+
+                for g in range(curr_G):
+                    tokens = list(chunk_completions[g].tokens)
+                    inp = tokens[:-1]
+                    # Pad to max_comp_len_chunk - 1
+                    inp += [0] * (max_comp_len_chunk - 1 - len(inp))
+                    comp_inputs.append(inp)
+
+                inputs_mx = mx.array(comp_inputs, dtype=mx.uint32)
+
+                # Single forward pass for all completion tokens (prefill-style)
+                # Chunk by sequence length to avoid huge logit tensors (B * chunk_size * V)
+                step_chunk_size = max(1, 4096 // curr_G)
+                for start_step in range(0, max_comp_len_chunk - 1, step_chunk_size):
+                    end_step = min(start_step + step_chunk_size, max_comp_len_chunk - 1)
+                    chunk_inputs = inputs_mx[:, start_step:end_step]
+
+                    logits_comp_chunk, _ = self.reference_model(chunk_inputs, cache=batched_cache)
+
+                    # Logprobs in f32 for precision
+                    log_probs_comp_chunk = fused_log_softmax(logits_comp_chunk.astype(mx.float32), temperature or 1.0)
+
+                    # Extract logprobs for this chunk
+                    for g in range(curr_G):
+                        tokens = chunk_completions[g].tokens
+                        for i in range(start_step + 1, min(end_step + 1, len(tokens))):
+                            token_id = tokens[i]
+                            chunk_completions[g].ref_log_probs.append(float(log_probs_comp_chunk[g, i - 1 - start_step, token_id]))
+
+                    # Evaluation to free transient memory and maintain cache
+                    mx.eval(batched_cache._keys + batched_cache._values)
 
     async def _process_rollout_chunk(
         self,
@@ -396,43 +518,59 @@ class InferenceNodeServicer(inference_pb2_grpc.InferenceNodeServicer):
         total_sequences = num_prompts * G
         from model import fused_log_softmax
 
-        # 1. Prefill prompts and collect logits
-        prompt_data = []  # (last_logits, cache, tokens)
-        for p in prompts:
-            tokens_list = list(p.tokens)
-            logger.info(f"Prompt {p.prompt_id}: {len(tokens_list)} tokens")
-            matched_len, matched_blocks = self.prefix_cache.lookup(tokens_list)
-            if matched_len == len(tokens_list) and len(tokens_list) > 0:
-                matched_len -= 1
-            logger.info(f"  prefix_cache hit: {matched_len}/{len(tokens_list)} tokens, {len(matched_blocks)} blocks")
+        # 1. Batched Prefill for all prompts in the chunk
+        prompt_data = [] # (last_logit, cache, tokens)
 
-            cache = self._create_cache(batch_size=1)
-            if matched_len > 0:
-                cache.offsets = mx.array([matched_len], dtype=mx.int32)
-                cache.block_tables[0] = list(matched_blocks)
-                for b in matched_blocks:
-                    self.allocator.retain(b)
-                # Restore KV data from paged pool into contiguous cache
-                for l in range(cache.num_layers):
-                    k, v = cache.gather_kv(l)
-                    cache._keys[l] = k
-                    cache._values[l] = v
-                logger.info(f"  restored KV from pool: keys[0] shape={cache._keys[0].shape}")
+        # Parallel prefill in chunks
+        for start_idx in range(0, num_prompts, 8):
+            end_idx = min(start_idx + 8, num_prompts)
+            chunk_prompts = prompts[start_idx:end_idx]
+            chunk_size = len(chunk_prompts)
 
-            tokens_suffix = mx.array(tokens_list[matched_len:], dtype=mx.uint32).reshape(1, -1)
-            logger.info(f"  running model on suffix of {tokens_suffix.shape[1]} tokens, offset={int(cache.offsets[0])}")
-            logits, cache = self.model(tokens_suffix, cache=cache)
+            lookups = [self.prefix_cache.lookup(list(p.tokens)) for p in chunk_prompts]
+            matched_lens = [l[0] for l in lookups]
+            matched_blocks_list = [l[1] for l in lookups]
+
+            chunk_cache = self._create_cache(batch_size=chunk_size)
+            chunk_cache.offsets = mx.array(matched_lens, dtype=mx.int32)
+            for i, blocks in enumerate(matched_blocks_list):
+                chunk_cache.block_tables[i] = list(blocks)
+
+            if max(matched_lens) > 0:
+                for l in range(chunk_cache.num_layers):
+                    k, v = chunk_cache.gather_kv(l)
+                    chunk_cache._keys[l] = k
+                    chunk_cache._values[l] = v
+
+            all_p_tokens = [list(p.tokens) for p in chunk_prompts]
+            suffixes = [t[ml:] for t, ml in zip(all_p_tokens, matched_lens)]
+            max_s_len = max(len(s) for s in suffixes)
+            padded_s = [s + [0] * (max_s_len - len(s)) for s in suffixes]
+            suffix_lens = [len(s) for s in suffixes]
+
+            logits, chunk_cache = self.model(mx.array(padded_s, dtype=mx.uint32), cache=chunk_cache)
             mx.eval(logits)
-            cache.advance(len(tokens_list) - matched_len)
-            logger.info(f"  after prefill: keys[0] shape={cache._keys[0].shape}, offset={int(cache.offsets[0])}")
 
-            # Flush KV to paged pool for prefix cache persistence
-            cache.flush_to_pool()
+            chunk_cache.advance(mx.array(suffix_lens, dtype=mx.int32))
+            chunk_cache.flush_to_pool()
             mx.eval(self.allocator.k_pool + self.allocator.v_pool)
-            logger.info(f"  flushed to pool: {len(cache.block_tables[0])} blocks")
-            self.prefix_cache.insert(tokens_list, cache.block_tables[0])
 
-            prompt_data.append((logits[0, -1], cache, tokens_list))
+            for i in range(chunk_size):
+                p_len = int(chunk_cache.offsets[i])
+                last_logit = logits[i, suffix_lens[i] - 1]
+
+                # Persistence
+                self.prefix_cache.insert(all_p_tokens[i], chunk_cache.block_tables[i])
+
+                # Individual cache for repeating
+                p_cache = self._create_cache(batch_size=1)
+                p_cache.offsets = mx.array([p_len], dtype=mx.int32)
+                p_cache.block_tables[0] = list(chunk_cache.block_tables[i])
+                for l in range(p_cache.num_layers):
+                    p_cache._keys[l] = chunk_cache._keys[l][i:i+1, :, :p_len, :]
+                    p_cache._values[l] = chunk_cache._values[l][i:i+1, :, :p_len, :]
+
+                prompt_data.append((last_logit, p_cache, all_p_tokens[i]))
 
         # 2. Fork G rollouts per prompt — copy prefill KV into batched decode cache
         batched_cache = self._create_cache(batch_size=total_sequences)
@@ -464,7 +602,7 @@ class InferenceNodeServicer(inference_pb2_grpc.InferenceNodeServicer):
         mx.eval(batched_cache._keys + batched_cache._values)
 
         for p_idx, (last_logits, p_cache, p_tokens) in enumerate(prompt_data):
-            log_probs_all = fused_log_softmax(last_logits[None], temperature or 1.0)[0]
+            log_probs_all = fused_log_softmax(last_logits[None].astype(mx.float32), temperature or 1.0)[0]
             p_offset = int(p_cache.offsets[0])
 
             for g_idx in range(G):
@@ -496,7 +634,7 @@ class InferenceNodeServicer(inference_pb2_grpc.InferenceNodeServicer):
             batched_cache.advance(1)
 
             # log_probs for all tokens in batch: (B, V)
-            log_probs_batch = fused_log_softmax(logits[:, 0, :], temperature or 1.0)
+            log_probs_batch = fused_log_softmax(logits[:, 0, :].astype(mx.float32), temperature or 1.0)
 
             new_active_tokens = []
             for b_idx in range(total_sequences):
@@ -842,7 +980,11 @@ def _register_with_scheduler(grpc_port: int, scheduler_url: str) -> None:
 async def serve(
     port: int = 50052,
     checkpoint_path: str = "Qwen/Qwen3-0.6B",
-    max_inflight_rollouts: int = DEFAULT_MAX_INFLIGHT_ROLLOUTS,
+    max_rollout_batch_size: int = 64,
+    max_judge_batch_size: int = 32,
+    max_ref_batch_size: int = 32,
+    num_blocks: int = 512,
+    block_size: int = 128,
     scheduler_url: str = "http://localhost:8080",
 ):
     """Start the gRPC inference node server."""
@@ -884,10 +1026,14 @@ async def serve(
     servicer = InferenceNodeServicer(
         model,
         reference_model,
-        max_inflight_rollouts=max_inflight_rollouts,
+        max_rollout_batch_size=max_rollout_batch_size,
+        max_judge_batch_size=max_judge_batch_size,
+        max_ref_batch_size=max_ref_batch_size,
         max_seq_len=config["max_seq_len"],
         vocab_size=config["vocab_size"],
         eos_token_id=151643, # Qwen3 EOS token
+        num_blocks=num_blocks,
+        block_size=block_size,
     )
 
     inference_pb2_grpc.add_InferenceNodeServicer_to_server(servicer, server)
@@ -916,7 +1062,11 @@ def main():
         default="Qwen/Qwen3-0.6B",
         help="Model checkpoint path",
     )
-    parser.add_argument("--max-inflight-rollouts", type=int, default=DEFAULT_MAX_INFLIGHT_ROLLOUTS, help="Maximum total rollouts (sequences) active at once")
+    parser.add_argument("--max-rollout-batch-size", type=int, default=64, help="Maximum total rollouts (sequences) active at once during generation")
+    parser.add_argument("--max-judge-batch-size", type=int, default=32, help="Maximum total judge items active at once during decoding")
+    parser.add_argument("--max-ref-batch-size", type=int, default=32, help="Maximum total ref sequences active at once")
+    parser.add_argument("--num-blocks", type=int, default=512, help="Number of KV blocks in the pool")
+    parser.add_argument("--block-size", type=int, default=128, help="Number of tokens per KV block")
     parser.add_argument("-v", "--verbose", action="count", default=0, help="Increase verbosity (can be used multiple times, -v for INFO, -vv for DEBUG)")
     parser.add_argument("--debug", action="store_true", help="Enable debug logging (equivalent to -vv)")
 
@@ -940,7 +1090,15 @@ def main():
     logger.setLevel(log_level)
     logger.info(f"Logging initialized at level {logging.getLevelName(log_level)}")
 
-    asyncio.run(serve(port=args.port, checkpoint_path=args.checkpoint, max_inflight_rollouts=args.max_inflight_rollouts))
+    asyncio.run(serve(
+        port=args.port,
+        checkpoint_path=args.checkpoint,
+        max_rollout_batch_size=args.max_rollout_batch_size,
+        max_judge_batch_size=args.max_judge_batch_size,
+        max_ref_batch_size=args.max_ref_batch_size,
+        num_blocks=args.num_blocks,
+        block_size=args.block_size,
+    ))
 
 if __name__ == "__main__":
     main()

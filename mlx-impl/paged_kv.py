@@ -3,16 +3,16 @@ import numpy as np
 
 _kernels = {}
 
-def update_paged_kv(k_new, v_new, block_tables, offsets, k_pool, v_pool, block_size):
+def update_paged_kv(k_new, v_new, block_tables, offsets, k_pool, v_pool, block_size, lengths=None):
     B, H, S_new, D = k_new.shape
     
     # Identify all blocks to be updated across the whole batch
-    # We'll do this in one go per layer to minimize copies
     k_pool_out = k_pool
     v_pool_out = v_pool
     
     block_tables_np = np.array(block_tables)
     offsets_np = np.array(offsets)
+    lengths_np = np.array(lengths) if lengths is not None else np.full((B,), S_new)
     
     # Collect all updates for this batch
     indices = []
@@ -21,38 +21,36 @@ def update_paged_kv(k_new, v_new, block_tables, offsets, k_pool, v_pool, block_s
     
     for b in range(B):
         offset = int(offsets_np[b])
-        num_blocks_to_update = (S_new + block_size - 1) // block_size
+        num_toks_to_write = int(lengths_np[b])
+        
+        num_blocks_to_update = (num_toks_to_write + block_size - 1) // block_size
         for i in range(num_blocks_to_update):
             seq_pos = offset + i * block_size
             block_idx_in_seq = seq_pos // block_size
+            
+            # This check is crucial to avoid IndexError when flushing padded batches
+            if block_idx_in_seq >= block_tables_np.shape[1]:
+                break
+                
             physical_block = int(block_tables_np[b, block_idx_in_seq])
             
             start_s = i * block_size
-            end_s = min((i + 1) * block_size, S_new)
+            end_s = min((i + 1) * block_size, num_toks_to_write)
             num_toks = end_s - start_s
             
-            # For now, we only support full blocks for one-shot indexing
-            # Partial blocks at the end are rare or can be handled by padding
-            if num_toks == block_size:
-                indices.append(physical_block)
-                k_pieces.append(k_new[b, :, start_s:end_s, :])
-                v_pieces.append(v_new[b, :, start_s:end_s, :])
-            else:
-                # Fallback for partial block (only at the very end of sequence)
-                k_pool_out = mx.slice_update(
-                    k_pool_out, k_new[b, :, start_s:end_s, :][None],
-                    mx.array([physical_block, 0, 0, 0]), (0, 1, 2, 3)
-                )
-                v_pool_out = mx.slice_update(
-                    v_pool_out, v_new[b, :, start_s:end_s, :][None],
-                    mx.array([physical_block, 0, 0, 0]), (0, 1, 2, 3)
-                )
+            if num_toks <= 0:
+                continue
 
-    if indices:
-        indices_mx = mx.array(indices)
-        k_pool_out[indices_mx] = mx.stack(k_pieces)
-        v_pool_out[indices_mx] = mx.stack(v_pieces)
-            
+            # In MLX, we update blocks one by one using slice_update
+            k_pool_out = mx.slice_update(
+                k_pool_out, k_new[b, :, start_s:end_s, :][None],
+                mx.array([physical_block, 0, 0, 0]), (0, 1, 2, 3)
+            )
+            v_pool_out = mx.slice_update(
+                v_pool_out, v_new[b, :, start_s:end_s, :][None],
+                mx.array([physical_block, 0, 0, 0]), (0, 1, 2, 3)
+            )
+
     return k_pool_out, v_pool_out
 
 

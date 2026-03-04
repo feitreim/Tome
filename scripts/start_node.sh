@@ -31,6 +31,9 @@ echo
 # Start the server
 uv run mlx-impl/node.py \
     --port "$PORT" \
-    --max-inflight-rollouts 64
+    --max-rollout-batch-size 64 \
+    --max-judge-batch-size 32 \
+    --max-ref-batch-size 32 \
+    --num-blocks 512
 
 # Note: Use Ctrl+C to stop the server

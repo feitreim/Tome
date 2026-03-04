@@ -205,6 +205,7 @@ class KVCache:
                 self.allocator.k_pool[layer_idx],
                 self.allocator.v_pool[layer_idx],
                 block_size,
+                lengths=self.offsets,
             )
             self.allocator.k_pool[layer_idx] = new_k_pool
             self.allocator.v_pool[layer_idx] = new_v_pool
