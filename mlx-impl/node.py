@@ -243,11 +243,11 @@ class InferenceNodeServicer(inference_pb2_grpc.InferenceNodeServicer):
             self.prefix_cache.insert(rubric_tokens, rubric_cache.block_tables[0])
 
         t0_judge = time.perf_counter()
-        
+
         # Process judge items sequentially for prefill, then batch decode
         item_caches = []
         item_logits = []
-        
+
         t_prefill_start = time.perf_counter()
         for idx, item in enumerate(request.items):
             full_prefix = rubric_tokens + list(item.prompt_tokens)
@@ -267,7 +267,7 @@ class InferenceNodeServicer(inference_pb2_grpc.InferenceNodeServicer):
             mx.eval(logits)
             cache.advance(len(full_prefix) - matched_len)
             self.prefix_cache.insert(full_prefix, cache.block_tables[0])
-            
+
             # Flush to pool so we can read it into contiguous array later if needed,
             # but we already have it in cache._keys. We need to retain it.
             item_caches.append(cache)
@@ -293,12 +293,12 @@ class InferenceNodeServicer(inference_pb2_grpc.InferenceNodeServicer):
             t_build_cache_start = time.perf_counter()
             batched_cache = self._create_cache(batch_size=B_chunk)
             max_len = max(int(c.offsets[0]) for c in chunk_item_caches)
-            
+
             H = self.num_kv_heads
             D = self.head_dim
             NL = batched_cache.num_layers
             dtype = chunk_item_caches[0]._keys[0].dtype
-            
+
             for l in range(NL):
                 k_parts = []
                 v_parts = []
@@ -313,10 +313,10 @@ class InferenceNodeServicer(inference_pb2_grpc.InferenceNodeServicer):
                     v_parts.append(v)
                 batched_cache._keys[l] = mx.concatenate(k_parts, axis=0)
                 batched_cache._values[l] = mx.concatenate(v_parts, axis=0)
-                
+
             for b in range(B_chunk):
                 batched_cache.offsets[b] = int(chunk_item_caches[b].offsets[0])
-                
+
             mx.eval(batched_cache._keys + batched_cache._values, batched_cache.offsets)
             t_build_cache_end = time.perf_counter()
             logger.info(f"Judge chunk {chunk_start//self.max_judge_batch_size} cache build took {t_build_cache_end - t_build_cache_start:.2f}s")
@@ -325,46 +325,46 @@ class InferenceNodeServicer(inference_pb2_grpc.InferenceNodeServicer):
             active_tokens = []
             active_log_probs = [[] for _ in range(B_chunk)]
             chunk_results = [[] for _ in range(B_chunk)]
-            
+
             # Sample first tokens
             logits_first = mx.stack(chunk_item_logits) # Shape: [B_chunk, V]
             log_probs_first = fused_log_softmax(logits_first.astype(mx.float32), request.temperature or 1.0)
-            
+
             for i, logits_i in enumerate(chunk_item_logits):
                 if request.temperature > 0:
                     token = self._sample_token(logits_i, request.temperature)
                 else:
                     token = int(mx.argmax(logits_i))
-                    
+
                 active_tokens.append(token)
                 active_log_probs[i].append(float(log_probs_first[i, token]))
                 chunk_results[i].append(token)
                 total_verdict_tokens += 1
-                
+
             active_mask = [True] * B_chunk
-            
+
             for _ in range(request.max_tokens - 1):
                 if not any(active_mask):
                     break
-                    
+
                 input_tokens = mx.array([[t if active_mask[i] else 0] for i, t in enumerate(active_tokens)], dtype=mx.uint32)
                 logits_step, _ = self.model(input_tokens, cache=batched_cache)
                 mx.eval(logits_step)
                 batched_cache.advance(1)
-                
+
                 logits_b = logits_step[:, 0, :]
                 log_probs_b = fused_log_softmax(logits_b.astype(mx.float32), request.temperature or 1.0)
-                
+
                 for i in range(B_chunk):
                     if not active_mask[i]:
                         continue
-                        
+
                     logits_i = logits_b[i]
                     if request.temperature > 0:
                         token = self._sample_token(logits_i, request.temperature)
                     else:
                         token = int(mx.argmax(logits_i))
-                        
+
                     active_tokens[i] = token
                     if token == self.eos_token_id:
                         active_mask[i] = False
@@ -372,7 +372,7 @@ class InferenceNodeServicer(inference_pb2_grpc.InferenceNodeServicer):
                         chunk_results[i].append(token)
                         active_log_probs[i].append(float(log_probs_b[i, token]))
                         total_verdict_tokens += 1
-                        
+
             t_decode_end = time.perf_counter()
             logger.info(f"Judge chunk {chunk_start//self.max_judge_batch_size} decode took {t_decode_end - t_decode_start:.2f}s")
 
@@ -396,7 +396,6 @@ class InferenceNodeServicer(inference_pb2_grpc.InferenceNodeServicer):
         temperature: float = 1.0,
     ) -> None:
         """Compute reference model log-probs fully batched without KV cache for maximum throughput."""
-        from model import fused_log_softmax
 
         def local_compute_logprobs(logits: mx.array, ids: mx.array, temp: float) -> mx.array:
             logits = (logits.astype(mx.float32) / temp)
@@ -405,7 +404,7 @@ class InferenceNodeServicer(inference_pb2_grpc.InferenceNodeServicer):
             return token_logits - log_z.squeeze(-1)
 
         t0 = time.perf_counter()
-        
+
         # Build list of all sequences to process
         all_work = []
         for p_idx, p in enumerate(prompts):
@@ -415,34 +414,34 @@ class InferenceNodeServicer(inference_pb2_grpc.InferenceNodeServicer):
                 all_work.append((p_idx, g, p_toks, c_toks))
 
         num_toks = 0
-        
+
         # Process in chunks of max_ref_batch_size
         for chunk_start in range(0, len(all_work), self.max_ref_batch_size):
             chunk_end = min(chunk_start + self.max_ref_batch_size, len(all_work))
             chunk = all_work[chunk_start:chunk_end]
-            
+
             all_seqs = []
             all_targets = []
             seq_lens = []
-            
+
             for p_idx, g, p_toks, c_toks in chunk:
                 if not c_toks:
                     all_seqs.append(p_toks)
                     all_targets.append([])
                     seq_lens.append(len(p_toks))
                     continue
-                    
+
                 full_seq = p_toks + c_toks[:-1]
                 all_seqs.append(full_seq)
                 all_targets.append(c_toks)
                 seq_lens.append(len(full_seq))
-                
+
             max_len = max(seq_lens)
             padded_seqs = [seq + [0] * (max_len - len(seq)) for seq in all_seqs]
             full_ids = mx.array(padded_seqs, dtype=mx.uint32)
-            
+
             logits, _ = self.reference_model(full_ids, cache=None)
-            
+
             lazy_lps = []
             for i, (p_idx, g, p_toks, c_toks) in enumerate(chunk):
                 if c_toks:
@@ -452,7 +451,7 @@ class InferenceNodeServicer(inference_pb2_grpc.InferenceNodeServicer):
                     lps = local_compute_logprobs(c_logits, c_targets, temperature or 1.0)
                     lazy_lps.append((p_idx, g, lps))
                     num_toks += len(c_toks)
-                    
+
             if lazy_lps:
                 mx.eval(*[lp for _, _, lp in lazy_lps])
                 for p_idx, g, lps in lazy_lps:
@@ -1025,6 +1024,11 @@ def main():
     parser.add_argument("--debug", action="store_true", help="Enable debug logging (equivalent to -vv)")
 
     args = parser.parse_args()
+
+    print(f"max rollouts concurrently: {args.max_rollout_batch_size}")
+    print(f"max ref lp calc concurrently: {args.max_ref_batch_size}")
+    print(f"max judge concurrently: {args.max_judge_batch_size}")
+
 
     # Configure logging based on verbosity
     log_level = logging.WARNING
