@@ -152,6 +152,8 @@ class InferenceNodeServicer(inference_pb2_grpc.InferenceNodeServicer):
 
             mx.eval(self.model.parameters())
             self.policy_version += 1
+            if hasattr(self, 'prefix_cache') and self.prefix_cache is not None:
+                self.prefix_cache.clear()
             self.prefix_cache = PrefixCache(self.allocator)
 
             logger.info(f"Weight update applied: policy_version={self.policy_version}")
@@ -252,73 +254,18 @@ class InferenceNodeServicer(inference_pb2_grpc.InferenceNodeServicer):
             mx.eval(self.allocator.k_pool + self.allocator.v_pool)
             self.prefix_cache.insert(rubric_tokens, rubric_cache.block_tables[0])
 
-        # 2. Batched prefill for all judge item prompts
-        num_items = len(request.items)
-        all_full_prefixes = [rubric_tokens + list(item.prompt_tokens) for item in request.items]
-
-        prompt_data = [] # (last_logit, cache, full_tokens)
-
-        # Parallel prefill in chunks
-        prefill_token_limit = 4096
-        for start_idx in range(0, num_items, 8): # Use small chunk size for stability
-            end_idx = min(start_idx + 8, num_items)
-            chunk_items = all_full_prefixes[start_idx:end_idx]
-            chunk_size = len(chunk_items)
-
-            lookups = [self.prefix_cache.lookup(p) for p in chunk_items]
-            matched_lens = [l[0] for l in lookups]
-            matched_blocks_list = [l[1] for l in lookups]
-
-            chunk_cache = self._create_cache(batch_size=chunk_size)
-            chunk_cache.offsets = mx.array(matched_lens, dtype=mx.int32)
-            for i, blocks in enumerate(matched_blocks_list):
-                chunk_cache.block_tables[i] = list(blocks)
-
-            if max(matched_lens) > 0:
-                for l in range(chunk_cache.num_layers):
-                    k, v = chunk_cache.gather_kv(l)
-                    chunk_cache._keys[l] = k
-                    chunk_cache._values[l] = v
-
-            suffixes = [p[ml:] for p, ml in zip(chunk_items, matched_lens)]
-            max_s_len = max(len(s) for s in suffixes)
-            padded_s = [s + [0] * (max_s_len - len(s)) for s in suffixes]
-            suffix_lens = [len(s) for s in suffixes]
-
-            logits, chunk_cache = self.model(mx.array(padded_s, dtype=mx.uint32), cache=chunk_cache)
-            mx.eval(logits)
-
-            chunk_cache.advance(mx.array(suffix_lens, dtype=mx.int32))
-            chunk_cache.flush_to_pool()
-            mx.eval(self.allocator.k_pool + self.allocator.v_pool)
-
-            for i in range(chunk_size):
-                p_len = int(chunk_cache.offsets[i])
-                last_logit = logits[i, suffix_lens[i] - 1]
-
-                # Persistence
-                self.prefix_cache.insert(chunk_items[i], chunk_cache.block_tables[i])
-
-                # Individual cache for decoding
-                p_cache = self._create_cache(batch_size=1)
-                p_cache.offsets = mx.array([p_len], dtype=mx.int32)
-                p_cache.block_tables[0] = list(chunk_cache.block_tables[i])
-                for l in range(p_cache.num_layers):
-                    p_cache._keys[l] = chunk_cache._keys[l][i:i+1, :, :p_len, :]
-                    p_cache._values[l] = chunk_cache._values[l][i:i+1, :, :p_len, :]
-
-                prompt_data.append((last_logit, p_cache))
-
-        # 3. Batched Decode for all verdicts (Chunked for memory efficiency)
-        final_results = []
-        total_verdict_tokens = 0
         t0_judge = time.perf_counter()
-
-        for chunk_start in range(0, num_items, self.max_judge_batch_size):
-            chunk_end = min(chunk_start + self.max_judge_batch_size, num_items)
-            chunk_size = chunk_end - chunk_start
-            chunk_prompt_data = prompt_data[chunk_start:chunk_end]
-            chunk_items = request.items[chunk_start:chunk_end]
+        
+        # Process judge items sequentially for prefill, then batch decode
+        item_caches = []
+        item_logits = []
+        
+        t_prefill_start = time.perf_counter()
+        for idx, item in enumerate(request.items):
+            full_prefix = rubric_tokens + list(item.prompt_tokens)
+            matched_len, matched_blocks = self.prefix_cache.lookup(full_prefix)
+            if matched_len == len(full_prefix) and len(full_prefix) > 0:
+                matched_len -= 1
 
             # Create a single batched cache for this chunk
             decode_cache = self._create_cache(batch_size=chunk_size)
@@ -326,86 +273,124 @@ class InferenceNodeServicer(inference_pb2_grpc.InferenceNodeServicer):
             chunk_results_data = [{"item_id": item.item_id, "tokens": [], "log_probs": []} for item in chunk_items]
             is_finished = [False] * chunk_size
 
-            # Fork chunk into decode_cache
-            max_p_len = max(int(d[1].offsets[0]) for d in chunk_prompt_data)
-            for l in range(self.num_layers):
-                k_parts = []
-                v_parts = []
-                for i in range(chunk_size):
-                    p_cache = chunk_prompt_data[i][1]
-                    p_len = int(p_cache.offsets[0])
-                    pad = max_p_len - p_len
-                    k, v = p_cache._keys[l], p_cache._values[l]
-                    if pad > 0:
-                        k = mx.concatenate([k, mx.zeros((1, self.num_kv_heads, pad, self.head_dim), dtype=k.dtype)], axis=2)
-                        v = mx.concatenate([v, mx.zeros((1, self.num_kv_heads, pad, self.head_dim), dtype=v.dtype)], axis=2)
-                    k_parts.append(k)
-                    v_parts.append(v)
-                decode_cache._keys[l] = mx.concatenate(k_parts, axis=0)
-                decode_cache._values[l] = mx.concatenate(v_parts, axis=0)
+            suffix = mx.array(full_prefix[matched_len:], dtype=mx.uint32).reshape(1, -1)
+            logits, cache = self.model(suffix, cache=cache)
+            mx.eval(logits)
+            cache.advance(len(full_prefix) - matched_len)
+            self.prefix_cache.insert(full_prefix, cache.block_tables[0])
+            
+            # Flush to pool so we can read it into contiguous array later if needed,
+            # but we already have it in cache._keys. We need to retain it.
+            item_caches.append(cache)
+            item_logits.append(logits[0, -1])
 
-            for i in range(chunk_size):
-                decode_cache.offsets[i] = int(chunk_prompt_data[i][1].offsets[0])
-                last_logit = chunk_prompt_data[i][0]
-                log_probs_first = fused_log_softmax(last_logit[None].astype(mx.float32), request.temperature or 1.0)[0]
+        t_prefill_end = time.perf_counter()
+        logger.info(f"Judge prefill for {len(request.items)} items took {t_prefill_end - t_prefill_start:.2f}s")
 
+        # Build batched cache for decoding
+        t_build_cache_start = time.perf_counter()
+        B = len(request.items)
+        batched_cache = self._create_cache(batch_size=B)
+        max_len = max(int(c.offsets[0]) for c in item_caches)
+        
+        H = self.num_kv_heads
+        D = self.head_dim
+        NL = batched_cache.num_layers
+        dtype = item_caches[0]._keys[0].dtype
+        
+        for l in range(NL):
+            k_parts = []
+            v_parts = []
+            for c in item_caches:
+                k = c._keys[l]
+                v = c._values[l]
+                pad = max_len - k.shape[2]
+                if pad > 0:
+                    k = mx.concatenate([k, mx.zeros((1, H, pad, D), dtype=dtype)], axis=2)
+                    v = mx.concatenate([v, mx.zeros((1, H, pad, D), dtype=dtype)], axis=2)
+                k_parts.append(k)
+                v_parts.append(v)
+            batched_cache._keys[l] = mx.concatenate(k_parts, axis=0)
+            batched_cache._values[l] = mx.concatenate(v_parts, axis=0)
+            
+        for b in range(B):
+            batched_cache.offsets[b] = int(item_caches[b].offsets[0])
+            
+        mx.eval(batched_cache._keys + batched_cache._values, batched_cache.offsets)
+        t_build_cache_end = time.perf_counter()
+        logger.info(f"Judge cache build took {t_build_cache_end - t_build_cache_start:.2f}s")
+
+        from model import fused_log_softmax
+        
+        t_decode_start = time.perf_counter()
+        active_tokens = []
+        active_log_probs = []
+        results = []
+        total_verdict_tokens = 0
+        
+        # Sample first tokens
+        logits_first = mx.stack(item_logits) # Shape: [B, V]
+        log_probs_first = fused_log_softmax(logits_first, request.temperature or 1.0)
+        
+        for i, logits_i in enumerate(item_logits):
+            if request.temperature > 0:
+                token = self._sample_token(logits_i, request.temperature)
+            else:
+                token = int(mx.argmax(logits_i))
+                
+            active_tokens.append(token)
+            active_log_probs.append([float(log_probs_first[i, token])])
+            results.append([token])
+            total_verdict_tokens += 1
+            
+        active_mask = [True] * B
+        
+        for _ in range(request.max_tokens - 1):
+            if not any(active_mask):
+                break
+                
+            input_tokens = mx.array([[t if active_mask[i] else 0] for i, t in enumerate(active_tokens)], dtype=mx.uint32)
+            logits_step, _ = self.model(input_tokens, cache=batched_cache)
+            mx.eval(logits_step)
+            batched_cache.advance(1)
+            
+            logits_b = logits_step[:, 0, :]
+            log_probs_b = fused_log_softmax(logits_b, request.temperature or 1.0)
+            
+            for i in range(B):
+                if not active_mask[i]:
+                    continue
+                    
+                logits_i = logits_b[i]
                 if request.temperature > 0:
-                    token = self._sample_token(last_logit, request.temperature)
+                    token = self._sample_token(logits_i, request.temperature)
                 else:
-                    token = int(mx.argmax(last_logit))
-
-                active_tokens.append(token)
-                chunk_results_data[i]["tokens"].append(token)
-                chunk_results_data[i]["log_probs"].append(float(log_probs_first[token]))
+                    token = int(mx.argmax(logits_i))
+                    
+                active_tokens[i] = token
                 if token == self.eos_token_id:
-                    is_finished[i] = True
+                    active_mask[i] = False
+                else:
+                    results[i].append(token)
+                    active_log_probs[i].append(float(log_probs_b[i, token]))
+                    total_verdict_tokens += 1
+                    
+        t_decode_end = time.perf_counter()
+        logger.info(f"Judge decode took {t_decode_end - t_decode_start:.2f}s for {total_verdict_tokens} tokens")
 
-            for step in range(request.max_tokens - 1):
-                if all(is_finished):
-                    break
-
-                current_tokens_mx = mx.array(active_tokens, dtype=mx.uint32).reshape(-1, 1)
-                logits_step, decode_cache = self.model(current_tokens_mx, cache=decode_cache)
-                mx.eval(logits_step)
-                decode_cache.advance(1)
-
-                log_probs_batch = fused_log_softmax(logits_step[:, 0, :].astype(mx.float32), request.temperature or 1.0)
-
-                new_active_tokens = []
-                for i in range(chunk_size):
-                    if is_finished[i]:
-                        new_active_tokens.append(self.eos_token_id)
-                        continue
-
-                    if request.temperature > 0:
-                        token = self._sample_token(logits_step[i, 0], request.temperature)
-                    else:
-                        token = int(mx.argmax(logits_step[i, 0]))
-
-                    chunk_results_data[i]["tokens"].append(token)
-                    chunk_results_data[i]["log_probs"].append(float(log_probs_batch[i, token]))
-
-                    if token == self.eos_token_id or len(chunk_results_data[i]["tokens"]) >= request.max_tokens:
-                        is_finished[i] = True
-
-                    new_active_tokens.append(token)
-                active_tokens = new_active_tokens
-
-            total_verdict_tokens += sum(len(res["tokens"]) for res in chunk_results_data)
-            final_results.extend([
-                inference_pb2.JudgeResult(
-                    item_id=res["item_id"],
-                    verdict_tokens=res["tokens"],
-                    log_probs=res["log_probs"]
-                )
-                for res in chunk_results_data
-            ])
+        judge_results = []
+        for i, item in enumerate(request.items):
+            judge_results.append(inference_pb2.JudgeResult(
+                item_id=item.item_id,
+                verdict_tokens=results[i],
+                log_probs=active_log_probs[i]
+            ))
 
         elapsed_judge = time.perf_counter() - t0_judge
         tps_judge = total_verdict_tokens / elapsed_judge if elapsed_judge > 0 else 0
         logger.info(f"Judge request completed: {num_items} items, {total_verdict_tokens} tokens in {elapsed_judge:.2f}s ({tps_judge:.1f} tok/s)")
 
-        return inference_pb2.JudgeResponse(batch_id=batch_id, results=final_results)
+        return inference_pb2.JudgeResponse(batch_id=batch_id, results=judge_results)
 
     async def _process_ref_logprobs_batched(
         self,
@@ -414,43 +399,75 @@ class InferenceNodeServicer(inference_pb2_grpc.InferenceNodeServicer):
         G: int,
         temperature: float = 1.0,
     ) -> None:
-        """Compute reference model log-probs for completions using batching."""
+        """Compute reference model log-probs fully batched without KV cache for maximum throughput."""
         from model import fused_log_softmax
 
-        for p_idx, (p, p_res) in enumerate(zip(prompts, results)):
-            tokens_list = list(p.tokens)
-            matched_len, matched_blocks = self.reference_prefix_cache.lookup(tokens_list)
-            if matched_len == len(tokens_list) and len(tokens_list) > 0:
-                matched_len -= 1
+        def local_compute_logprobs(logits: mx.array, ids: mx.array, temp: float) -> mx.array:
+            logits = (logits.astype(mx.float32) / temp)
+            log_z = mx.logsumexp(logits, axis=-1, keepdims=True)
+            token_logits = mx.take_along_axis(logits, ids[..., None], axis=-1).squeeze(-1)
+            return token_logits - log_z.squeeze(-1)
 
-            # 1. Prefill prompt once
-            cache = self._create_cache(batch_size=1)
-            if matched_len > 0:
-                cache.offsets = mx.array([matched_len], dtype=mx.int32)
-                cache.block_tables[0] = list(matched_blocks)
-                for b in matched_blocks:
-                    self.allocator.retain(b)
-                for l in range(cache.num_layers):
-                    k, v = cache.gather_kv(l)
-                    cache._keys[l] = k
-                    cache._values[l] = v
-
-            tokens_suffix = mx.array(tokens_list[matched_len:], dtype=mx.uint32).reshape(1, -1)
-            logits, cache = self.reference_model(tokens_suffix, cache=cache)
-            mx.eval(logits)
-            cache.advance(len(tokens_list) - matched_len)
-
-            cache.flush_to_pool()
-            mx.eval(self.allocator.k_pool + self.allocator.v_pool)
-            self.reference_prefix_cache.insert(tokens_list, cache.block_tables[0])
-
-            # 2. Batched forward pass for completions
-            # Completion token 0 logprob comes from prompt's last logit
-            log_probs_first = fused_log_softmax(logits[0, -1:].astype(mx.float32), temperature or 1.0)[0]
+        t0 = time.perf_counter()
+        
+        # Build batched full sequences: prompt + completion[:-1]
+        all_seqs = []
+        all_targets = []
+        seq_lens = []
+        
+        for p_idx, p in enumerate(prompts):
+            p_toks = list(p.tokens)
             for g in range(G):
-                first_token = p_res.completions[g].tokens[0]
-                p_res.completions[g].ref_log_probs.append(float(log_probs_first[first_token]))
+                c_toks = list(results[p_idx].completions[g].tokens)
+                if not c_toks:
+                    all_seqs.append(p_toks)
+                    all_targets.append([])
+                    seq_lens.append(len(p_toks))
+                    continue
+                    
+                full_seq = p_toks + c_toks[:-1]
+                targets = c_toks
+                all_seqs.append(full_seq)
+                all_targets.append(targets)
+                seq_lens.append(len(full_seq))
+                
+        max_len = max(seq_lens)
+        
+        # Pad sequences
+        padded_seqs = []
+        for seq in all_seqs:
+            pad_len = max_len - len(seq)
+            padded_seqs.append(seq + [0] * pad_len)
+            
+        full_ids = mx.array(padded_seqs, dtype=mx.uint32)
+        
+        # Single forward pass without KV cache
+        logits, _ = self.reference_model(full_ids, cache=None)
+        
+        idx = 0
+        num_toks = 0
+        lazy_lps = []
+        
+        for p_idx, p in enumerate(prompts):
+            p_len = len(list(p.tokens))
+            for g in range(G):
+                c_toks = all_targets[idx]
+                if c_toks:
+                    # Logits for the completion are from index p_len - 1 to p_len + len(c_toks) - 2
+                    c_logits = logits[idx, p_len - 1 : p_len - 1 + len(c_toks)]
+                    c_targets = mx.array(c_toks, dtype=mx.uint32)
+                    lps = local_compute_logprobs(c_logits, c_targets, temperature or 1.0)
+                    lazy_lps.append((p_idx, g, lps))
+                    num_toks += len(c_toks)
+                idx += 1
+                
+        if lazy_lps:
+            mx.eval(*[lp for _, _, lp in lazy_lps])
+            
+        for p_idx, g, lps in lazy_lps:
+            results[p_idx].completions[g].ref_log_probs.extend(lps.tolist())
 
+<<<<<<< HEAD
             max_comp_len = max(len(c.tokens) for c in p_res.completions)
             if max_comp_len <= 1:
                 continue
@@ -505,6 +522,10 @@ class InferenceNodeServicer(inference_pb2_grpc.InferenceNodeServicer):
 
                     # Evaluation to free transient memory and maintain cache
                     mx.eval(batched_cache._keys + batched_cache._values)
+=======
+        elapsed = time.perf_counter() - t0
+        logger.info(f"Ref log-probs non-KV batched completed: {num_toks} tokens in {elapsed:.2f}s ({num_toks/elapsed:.1f} tok/s)")
+>>>>>>> 810b971 (chore: Apply mlx-impl node and kvcache performance optimizations)
 
     async def _process_rollout_chunk(
         self,
@@ -946,7 +967,7 @@ class InferenceNodeServicer(inference_pb2_grpc.InferenceNodeServicer):
         scaled_logits = logits / temperature
 
         # Get indices of top-k highest logits
-        top_indices = mx.argsort(scaled_logits)[-top_k:]
+        top_indices = mx.argpartition(scaled_logits, scaled_logits.size - top_k)[-top_k:]
         top_logits = scaled_logits[top_indices]
 
         # Sample from categorical distribution over top-k, map back to vocab index

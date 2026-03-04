@@ -52,6 +52,17 @@ class PrefixCache:
             node.update_access()
         self.num_cached_tokens = max(self.num_cached_tokens, len(tokens))
 
+    def clear(self):
+        def _clear_node(node):
+            for child in node.children.values():
+                _clear_node(child)
+            for b in node.blocks:
+                self.allocator.release(b)
+            node.children.clear()
+        _clear_node(self.root)
+        self.root = PrefixNode([])
+        self.num_cached_tokens = 0
+
 
 class BlockAllocator:
     def __init__(
