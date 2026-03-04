@@ -29,8 +29,7 @@ sys.path.insert(0, str(Path(__file__).parent / "generated"))
 import inference_pb2
 import inference_pb2_grpc
 
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger(__name__)
+logger = logging.getLogger("tome_node")
 
 DEFAULT_MAX_INFLIGHT_ROLLOUTS = 64
 
@@ -243,7 +242,8 @@ class InferenceNodeServicer(inference_pb2_grpc.InferenceNodeServicer):
 
         # Process judge items
         # Rely on prefix caching for efficiency across items sharing prompts
-        for item in request.items:
+        for idx, item in enumerate(request.items):
+            logger.debug(f"  Judging item {idx+1}/{len(request.items)}: {item.item_id}")
             full_prefix = rubric_tokens + list(item.prompt_tokens)
             matched_len, matched_blocks = self.prefix_cache.lookup(full_prefix)
             if matched_len == len(full_prefix) and len(full_prefix) > 0:
@@ -519,8 +519,8 @@ class InferenceNodeServicer(inference_pb2_grpc.InferenceNodeServicer):
                 new_active_tokens.append(token)
 
             active_tokens = new_active_tokens
-            if step % 10 == 0:
-                logger.info(f"Rollout step {step}: {sum(is_finished)}/{total_sequences} finished")
+            if (step + 1) % 5 == 0 or step == 0 or (step + 1) == (max_tokens - 1):
+                logger.info(f"Rollout step {step + 1}/{max_tokens}: {sum(is_finished)}/{total_sequences} finished")
 
         # 4. Format results
         final_prompt_results = []
@@ -917,8 +917,28 @@ def main():
         help="Model checkpoint path",
     )
     parser.add_argument("--max-inflight-rollouts", type=int, default=DEFAULT_MAX_INFLIGHT_ROLLOUTS, help="Maximum total rollouts (sequences) active at once")
+    parser.add_argument("-v", "--verbose", action="count", default=0, help="Increase verbosity (can be used multiple times, -v for INFO, -vv for DEBUG)")
+    parser.add_argument("--debug", action="store_true", help="Enable debug logging (equivalent to -vv)")
 
     args = parser.parse_args()
+
+    # Configure logging based on verbosity
+    log_level = logging.WARNING
+    if args.debug or args.verbose >= 2:
+        log_level = logging.DEBUG
+    elif args.verbose == 1:
+        log_level = logging.INFO
+    else:
+        # Default to INFO if neither -v nor --debug is provided, to match previous behavior
+        log_level = logging.INFO
+
+    logging.basicConfig(
+        level=log_level,
+        format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
+        force=True
+    )
+    logger.setLevel(log_level)
+    logger.info(f"Logging initialized at level {logging.getLevelName(log_level)}")
 
     asyncio.run(serve(port=args.port, checkpoint_path=args.checkpoint, max_inflight_rollouts=args.max_inflight_rollouts))
 
