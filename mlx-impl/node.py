@@ -905,7 +905,7 @@ async def serve(
     await server.wait_for_termination()
 
 
-if __name__ == "__main__":
+def main():
     import argparse
 
     parser = argparse.ArgumentParser(description="MLX inference node with gRPC server for Qwen3-0.6B")
@@ -921,3 +921,6 @@ if __name__ == "__main__":
     args = parser.parse_args()
 
     asyncio.run(serve(port=args.port, checkpoint_path=args.checkpoint, max_inflight_rollouts=args.max_inflight_rollouts))
+
+if __name__ == "__main__":
+    main()
