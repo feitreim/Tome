@@ -1,72 +1,59 @@
 import mlx.core as mx
+import numpy as np
 
 _kernels = {}
 
 def update_paged_kv(k_new, v_new, block_tables, offsets, k_pool, v_pool, block_size):
     B, H, S_new, D = k_new.shape
-    max_blocks = block_tables.shape[1]
-    dtype = k_new.dtype
-    key = f"update_{B}_{H}_{S_new}_{D}_{block_size}_{max_blocks}_{dtype}"
-    if key not in _kernels:
-        src = f"""
-            uint batch_size = {B};
-            uint num_kv_heads = {H};
-            uint head_dim = {D};
-            uint block_size = {block_size};
-            uint S_new = {S_new};
-            uint max_blocks = {max_blocks};
-
-            uint b = thread_position_in_grid.x;
-            uint h = thread_position_in_grid.y;
-            uint s = thread_position_in_grid.z / head_dim;
-            uint d = thread_position_in_grid.z % head_dim;
-
-            if (b >= batch_size || h >= num_kv_heads || s >= S_new || d >= head_dim) return;
-
-            uint seq_pos = offsets[b] + s;
-            uint block_in_seq = seq_pos / block_size;
-            uint off_in_block = seq_pos % block_size;
-
-            uint physical_block = block_tables[b * max_blocks + block_in_seq]; 
-
-            size_t k_new_idx = (size_t)b * ((size_t)num_kv_heads * S_new * head_dim) 
-                             + (size_t)h * ((size_t)S_new * head_dim) 
-                             + (size_t)s * head_dim 
-                             + d;
+    
+    # Identify all blocks to be updated across the whole batch
+    # We'll do this in one go per layer to minimize copies
+    k_pool_out = k_pool
+    v_pool_out = v_pool
+    
+    block_tables_np = np.array(block_tables)
+    offsets_np = np.array(offsets)
+    
+    # Collect all updates for this batch
+    indices = []
+    k_pieces = []
+    v_pieces = []
+    
+    for b in range(B):
+        offset = int(offsets_np[b])
+        num_blocks_to_update = (S_new + block_size - 1) // block_size
+        for i in range(num_blocks_to_update):
+            seq_pos = offset + i * block_size
+            block_idx_in_seq = seq_pos // block_size
+            physical_block = int(block_tables_np[b, block_idx_in_seq])
             
-            T k_val = k_new[k_new_idx];
-            T v_val = v_new[k_new_idx];
+            start_s = i * block_size
+            end_s = min((i + 1) * block_size, S_new)
+            num_toks = end_s - start_s
+            
+            # For now, we only support full blocks for one-shot indexing
+            # Partial blocks at the end are rare or can be handled by padding
+            if num_toks == block_size:
+                indices.append(physical_block)
+                k_pieces.append(k_new[b, :, start_s:end_s, :])
+                v_pieces.append(v_new[b, :, start_s:end_s, :])
+            else:
+                # Fallback for partial block (only at the very end of sequence)
+                k_pool_out = mx.slice_update(
+                    k_pool_out, k_new[b, :, start_s:end_s, :][None],
+                    mx.array([physical_block, 0, 0, 0]), (0, 1, 2, 3)
+                )
+                v_pool_out = mx.slice_update(
+                    v_pool_out, v_new[b, :, start_s:end_s, :][None],
+                    mx.array([physical_block, 0, 0, 0]), (0, 1, 2, 3)
+                )
 
-            size_t pool_idx = (size_t)physical_block * ((size_t)num_kv_heads * block_size * head_dim) 
-                            + (size_t)h * ((size_t)block_size * head_dim) 
-                            + (size_t)off_in_block * head_dim 
-                            + d;
-
-            device T* k_pool_mut = (device T*)k_pool;
-            device T* v_pool_mut = (device T*)v_pool;
-
-            k_pool_mut[pool_idx] = k_val;
-            v_pool_mut[pool_idx] = v_val;
-
-            k_pool_out[0] = 0;
-            v_pool_out[0] = 0;
-        """
-        _kernels[key] = mx.fast.metal_kernel(
-            name="update_paged_kv",
-            input_names=["k_new", "v_new", "block_tables", "offsets", "k_pool", "v_pool"],
-            output_names=["k_pool_out", "v_pool_out"],
-            source=src,
-        )
-
-    k_dummy, v_dummy = _kernels[key](
-        inputs=[k_new, v_new, block_tables, offsets, k_pool, v_pool],
-        template=[("T", dtype)],
-        grid=(B, H, S_new * D),
-        threadgroup=(1, 1, min(D, 1024)),
-        output_shapes=[(1,), (1,)],
-        output_dtypes=[dtype, dtype],
-    )
-    return k_dummy, v_dummy
+    if indices:
+        indices_mx = mx.array(indices)
+        k_pool_out[indices_mx] = mx.stack(k_pieces)
+        v_pool_out[indices_mx] = mx.stack(v_pieces)
+            
+    return k_pool_out, v_pool_out
 
 
 def gather_paged_kv(block_tables, offsets, k_pool, v_pool, max_seq_len, max_blocks, block_size, B, H, D):

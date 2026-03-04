@@ -197,7 +197,7 @@ class KVCache:
         for layer_idx in range(self.num_layers):
             if self._keys[layer_idx] is None:
                 continue
-            update_paged_kv(
+            new_k_pool, new_v_pool = update_paged_kv(
                 self._keys[layer_idx],
                 self._values[layer_idx],
                 block_tables_mx,
@@ -206,37 +206,40 @@ class KVCache:
                 self.allocator.v_pool[layer_idx],
                 block_size,
             )
+            self.allocator.k_pool[layer_idx] = new_k_pool
+            self.allocator.v_pool[layer_idx] = new_v_pool
+        mx.eval(self.allocator.k_pool + self.allocator.v_pool)
 
     def gather_kv(self, layer_idx: int, new_offsets: Optional[mx.array] = None) -> tuple[mx.array, mx.array]:
         """Gather KV from paged pool. Used for restoring from prefix cache."""
         self.allocator._ensure_pools()
-        all_k, all_v = [], []
-        offsets = np.array(new_offsets) if new_offsets is not None else np.array(self.offsets)
-        for b_idx in range(self.batch_size):
-            indices = self.block_tables[b_idx]
-            if not indices:
-                all_k.append(mx.zeros((self.num_kv_heads, 0, self.head_dim), dtype=self.allocator.dtype))
-                all_v.append(mx.zeros((self.num_kv_heads, 0, self.head_dim), dtype=self.allocator.dtype))
-                continue
-            k_blocks = [self.allocator.k_pool[layer_idx][i] for i in indices]
-            v_blocks = [self.allocator.v_pool[layer_idx][i] for i in indices]
-            k_seq = mx.concatenate(k_blocks, axis=1)
-            v_seq = mx.concatenate(v_blocks, axis=1)
-            all_k.append(k_seq[:, : int(offsets[b_idx]), :])
-            all_v.append(v_seq[:, : int(offsets[b_idx]), :])
-        max_len = int(np.max(offsets))
-        padded_k, padded_v = [], []
-        for b_idx in range(self.batch_size):
-            curr_k, curr_v = all_k[b_idx], all_v[b_idx]
-            curr_len = curr_k.shape[1]
-            if curr_len < max_len:
-                pad_len = max_len - curr_len
-                curr_k = mx.concatenate(
-                    [curr_k, mx.zeros((self.num_kv_heads, pad_len, self.head_dim), dtype=self.allocator.dtype)], axis=1
-                )
-                curr_v = mx.concatenate(
-                    [curr_v, mx.zeros((self.num_kv_heads, pad_len, self.head_dim), dtype=self.allocator.dtype)], axis=1
-                )
-            padded_k.append(curr_k)
-            padded_v.append(curr_v)
-        return mx.stack(padded_k), mx.stack(padded_v)
+        B = self.batch_size
+        H = self.num_kv_heads
+        D = self.head_dim
+        block_size = self.allocator.block_size
+        offsets = new_offsets if new_offsets is not None else self.offsets
+        
+        # Prepare block tables for the kernel
+        max_blocks_in_batch = max(len(bt) for bt in self.block_tables) if self.block_tables else 0
+        if max_blocks_in_batch == 0:
+            max_len = int(mx.max(offsets))
+            return mx.zeros((B, H, max_len, D), dtype=self.allocator.dtype), \
+                   mx.zeros((B, H, max_len, D), dtype=self.allocator.dtype)
+        
+        flat_bt = np.zeros((B, max_blocks_in_batch), dtype=np.int32)
+        for b_idx, bt in enumerate(self.block_tables):
+            flat_bt[b_idx, : len(bt)] = bt
+        block_tables_mx = mx.array(flat_bt)
+        
+        max_len = int(mx.max(offsets))
+        
+        return gather_paged_kv(
+            block_tables_mx,
+            offsets,
+            self.allocator.k_pool[layer_idx],
+            self.allocator.v_pool[layer_idx],
+            max_len,
+            max_blocks_in_batch,
+            block_size,
+            B, H, D
+        )

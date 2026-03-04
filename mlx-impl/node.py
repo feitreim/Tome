@@ -321,8 +321,9 @@ class InferenceNodeServicer(inference_pb2_grpc.InferenceNodeServicer):
 
         for p_idx, (p, p_res) in enumerate(zip(prompts, results)):
             tokens_list = list(p.tokens)
-            # Prefix cache disabled for debugging
-            matched_len, matched_blocks = 0, []
+            matched_len, matched_blocks = self.reference_prefix_cache.lookup(tokens_list)
+            if matched_len == len(tokens_list) and len(tokens_list) > 0:
+                matched_len -= 1
 
             # 1. Prefill prompt once
             cache = self._create_cache(batch_size=1)
@@ -400,11 +401,9 @@ class InferenceNodeServicer(inference_pb2_grpc.InferenceNodeServicer):
         for p in prompts:
             tokens_list = list(p.tokens)
             logger.info(f"Prompt {p.prompt_id}: {len(tokens_list)} tokens")
-            # Prefix cache disabled for debugging
-            matched_len, matched_blocks = 0, []
-            # matched_len, matched_blocks = self.prefix_cache.lookup(tokens_list)
-            # if matched_len == len(tokens_list) and len(tokens_list) > 0:
-            #     matched_len -= 1
+            matched_len, matched_blocks = self.prefix_cache.lookup(tokens_list)
+            if matched_len == len(tokens_list) and len(tokens_list) > 0:
+                matched_len -= 1
             logger.info(f"  prefix_cache hit: {matched_len}/{len(tokens_list)} tokens, {len(matched_blocks)} blocks")
 
             cache = self._create_cache(batch_size=1)
