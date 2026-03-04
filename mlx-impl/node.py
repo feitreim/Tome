@@ -289,6 +289,7 @@ class InferenceNodeServicer(inference_pb2_grpc.InferenceNodeServicer):
 
         # 3. Batched Decode for all verdicts (Chunked for memory efficiency)
         final_judge_results = []
+        total_verdict_tokens = 0
         num_items = len(request.items)
         from model import fused_log_softmax
 
@@ -338,7 +339,7 @@ class InferenceNodeServicer(inference_pb2_grpc.InferenceNodeServicer):
             
             # Sample first tokens
             logits_first = mx.stack(chunk_item_logits) # Shape: [B_chunk, V]
-            log_probs_first = fused_log_softmax(logits_first, request.temperature or 1.0)
+            log_probs_first = fused_log_softmax(logits_first.astype(mx.float32), request.temperature or 1.0)
             
             for i, logits_i in enumerate(chunk_item_logits):
                 if request.temperature > 0:
@@ -363,7 +364,7 @@ class InferenceNodeServicer(inference_pb2_grpc.InferenceNodeServicer):
                 batched_cache.advance(1)
                 
                 logits_b = logits_step[:, 0, :]
-                log_probs_b = fused_log_softmax(logits_b, request.temperature or 1.0)
+                log_probs_b = fused_log_softmax(logits_b.astype(mx.float32), request.temperature or 1.0)
                 
                 for i in range(B_chunk):
                     if not active_mask[i]:
@@ -397,9 +398,7 @@ class InferenceNodeServicer(inference_pb2_grpc.InferenceNodeServicer):
         tps_judge = total_verdict_tokens / elapsed_judge if elapsed_judge > 0 else 0
         logger.info(f"Judge request completed: {num_items} items, {total_verdict_tokens} tokens in {elapsed_judge:.2f}s ({tps_judge:.1f} tok/s)")
 
-        return inference_pb2.JudgeResponse(batch_id=batch_id, results=final_judge_results)
-
-    async def _process_ref_logprobs_batched(
+        return inference_pb2.JudgeResponse(batch_id=batch_id, results=final_judge_results)    async def _process_ref_logprobs_batched(
         self,
         prompts: list[inference_pb2.Prompt],
         results: list[inference_pb2.PromptRollout],
@@ -526,10 +525,7 @@ class InferenceNodeServicer(inference_pb2_grpc.InferenceNodeServicer):
                     mx.eval(batched_cache._keys + batched_cache._values)
 =======
         elapsed = time.perf_counter() - t0
-        logger.info(f"Ref log-probs non-KV batched completed: {num_toks} tokens in {elapsed:.2f}s ({num_toks/elapsed:.1f} tok/s)")
->>>>>>> 810b971 (chore: Apply mlx-impl node and kvcache performance optimizations)
-
-    async def _process_rollout_chunk(
+        logger.info(f"Ref log-probs non-KV batched completed: {num_toks} tokens in {elapsed:.2f}s ({num_toks/elapsed:.1f} tok/s)")    async def _process_rollout_chunk(
         self,
         prompts: list[inference_pb2.Prompt],
         G: int,
